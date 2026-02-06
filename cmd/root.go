@@ -58,8 +58,9 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to load config: %w", err)
 	}
 
-	if startSlot > 0 {
+	if cmd.Flags().Changed("start-slot") {
 		cfg.StartSlot = startSlot
+		cfg.StartSlotEnabled = true
 		log.WithField("start_slot", startSlot).Info("rescanning from specified slot")
 	}
 

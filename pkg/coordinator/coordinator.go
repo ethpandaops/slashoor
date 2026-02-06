@@ -183,7 +183,7 @@ func (s *service) backfillAttestations() error {
 
 	var startSlot, endSlot uint64
 
-	if s.cfg.StartSlot > 0 {
+	if s.cfg.StartSlotEnabled {
 		startSlot = s.cfg.StartSlot
 		endSlot = uint64(finality.HeadSlot)
 	} else if s.cfg.BackfillSlots > 0 {

@@ -18,8 +18,10 @@ type Config struct {
 
 	// StartSlot, if set via --start-slot flag, rescans from this slot to head on startup.
 	// Useful for rescanning historical attestations.
-	// If 0, uses BackfillSlots instead.
 	StartSlot uint64 `yaml:"-"`
+
+	// StartSlotEnabled indicates --start-slot was explicitly set.
+	StartSlotEnabled bool `yaml:"-"`
 
 	// BackfillSlots is the number of historical slots to fetch on startup.
 	// Only used if StartSlot is 0.
@@ -70,6 +72,10 @@ func (c *Config) Validate() error {
 
 	if err := c.Submitter.Validate(); err != nil {
 		return fmt.Errorf("submitter config: %w", err)
+	}
+
+	if c.BackfillSlots == 0 {
+		c.BackfillSlots = 64
 	}
 
 	return nil

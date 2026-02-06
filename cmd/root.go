@@ -15,8 +15,9 @@ import (
 )
 
 var (
-	cfgFile  string
-	logLevel string
+	cfgFile   string
+	logLevel  string
+	startSlot uint64
 )
 
 var rootCmd = &cobra.Command{
@@ -35,6 +36,7 @@ func Execute() error {
 func init() {
 	rootCmd.PersistentFlags().StringVar(&cfgFile, "config", "config.yaml", "config file path")
 	rootCmd.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level (debug, info, warn, error)")
+	rootCmd.PersistentFlags().Uint64Var(&startSlot, "start-slot", 0, "rescan from this slot to head on startup (0 = disabled)")
 	rootCmd.AddCommand(versionCmd)
 }
 
@@ -54,6 +56,11 @@ func run(cmd *cobra.Command, args []string) error {
 	cfg, err := loadConfig(cfgFile)
 	if err != nil {
 		return fmt.Errorf("failed to load config: %w", err)
+	}
+
+	if startSlot > 0 {
+		cfg.StartSlot = startSlot
+		log.WithField("start_slot", startSlot).Info("rescanning from specified slot")
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())

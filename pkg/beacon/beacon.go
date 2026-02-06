@@ -70,10 +70,18 @@ type HeadEvent struct {
 	Block phase0.Root
 }
 
+// Finality contains the current finality checkpoints.
+type Finality struct {
+	FinalizedEpoch phase0.Epoch
+	FinalizedSlot  phase0.Slot
+	HeadSlot       phase0.Slot
+}
+
 // Service defines the interface for beacon node interactions.
 type Service interface {
 	Start(ctx context.Context) error
 	Stop() error
+	GetFinality(ctx context.Context) (*Finality, error)
 	GetCommittees(ctx context.Context, slot phase0.Slot) ([]*Committee, error)
 	GetBlockAttestations(ctx context.Context, slot phase0.Slot) ([]*Attestation, error)
 	SubmitAttesterSlashing(ctx context.Context, slashing *AttesterSlashing) error
@@ -185,6 +193,80 @@ func (s *service) cleanupCommitteeCache(ctx context.Context) {
 			s.committeeMu.Unlock()
 		}
 	}
+}
+
+// GetFinality retrieves the current finality checkpoints.
+func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
+	var lastErr error
+
+	for _, n := range s.getHealthyNodes() {
+		resp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/states/head/finality_checkpoints", nil)
+		if err != nil {
+			lastErr = err
+			s.markNodeUnhealthy(n)
+
+			continue
+		}
+
+		defer resp.Body.Close()
+
+		var result struct {
+			Data struct {
+				Finalized struct {
+					Epoch string `json:"epoch"`
+				} `json:"finalized"`
+			} `json:"data"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			lastErr = fmt.Errorf("failed to decode finality response: %w", err)
+
+			continue
+		}
+
+		finalizedEpoch, _ := parseUint64(result.Data.Finalized.Epoch)
+
+		headResp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/headers/head", nil)
+		if err != nil {
+			lastErr = err
+
+			continue
+		}
+
+		defer headResp.Body.Close()
+
+		var headResult struct {
+			Data struct {
+				Header struct {
+					Message struct {
+						Slot string `json:"slot"`
+					} `json:"message"`
+				} `json:"header"`
+			} `json:"data"`
+		}
+
+		if err := json.NewDecoder(headResp.Body).Decode(&headResult); err != nil {
+			lastErr = fmt.Errorf("failed to decode head response: %w", err)
+
+			continue
+		}
+
+		headSlot, _ := parseUint64(headResult.Data.Header.Message.Slot)
+
+		s.markNodeHealthy(n)
+
+		return &Finality{
+			FinalizedEpoch: phase0.Epoch(finalizedEpoch),
+			FinalizedSlot:  phase0.Slot(finalizedEpoch * 32),
+			HeadSlot:       phase0.Slot(headSlot),
+		}, nil
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	return nil, ErrAllNodesFailed
 }
 
 // GetCommittees retrieves beacon committees for a specific slot.

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 
 	"github.com/slashoor/slashoor/pkg/beacon"
@@ -77,6 +78,10 @@ func (s *service) Start(ctx context.Context) error {
 	}
 
 	s.wireServices()
+
+	if err := s.backfillAttestations(); err != nil {
+		s.log.WithError(err).Warn("failed to backfill attestations")
+	}
 
 	if err := s.subscribeToHeads(); err != nil {
 		return fmt.Errorf("failed to subscribe to heads: %w", err)
@@ -168,4 +173,77 @@ func (s *service) handleHead(event *beacon.HeadEvent) {
 	for _, att := range attestations {
 		s.indexer.ProcessAttestation(att)
 	}
+}
+
+func (s *service) backfillAttestations() error {
+	finality, err := s.beacon.GetFinality(s.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get finality: %w", err)
+	}
+
+	var startSlot, endSlot uint64
+
+	if s.cfg.StartSlot > 0 {
+		startSlot = s.cfg.StartSlot
+		endSlot = uint64(finality.HeadSlot)
+	} else if s.cfg.BackfillSlots > 0 {
+		endSlot = uint64(finality.HeadSlot)
+
+		if endSlot > s.cfg.BackfillSlots {
+			startSlot = endSlot - s.cfg.BackfillSlots
+		}
+	} else {
+		return nil
+	}
+
+	if startSlot >= endSlot {
+		return nil
+	}
+
+	totalSlots := endSlot - startSlot
+	s.log.WithFields(logrus.Fields{
+		"start_slot":  startSlot,
+		"end_slot":    endSlot,
+		"total_slots": totalSlots,
+	}).Info("backfilling attestations")
+
+	var (
+		totalAttestations uint64
+		processedSlots    uint64
+	)
+
+	for slot := startSlot; slot <= endSlot; slot++ {
+		if s.ctx.Err() != nil {
+			return s.ctx.Err()
+		}
+
+		attestations, err := s.beacon.GetBlockAttestations(s.ctx, phase0.Slot(slot))
+		if err != nil {
+			s.log.WithError(err).WithField("slot", slot).Debug("failed to get block attestations")
+
+			continue
+		}
+
+		for _, att := range attestations {
+			s.indexer.ProcessAttestation(att)
+			totalAttestations++
+		}
+
+		processedSlots++
+
+		if processedSlots%100 == 0 {
+			s.log.WithFields(logrus.Fields{
+				"slot":               slot,
+				"progress":           fmt.Sprintf("%.1f%%", float64(processedSlots)/float64(totalSlots)*100),
+				"total_attestations": totalAttestations,
+			}).Info("backfill progress")
+		}
+	}
+
+	s.log.WithFields(logrus.Fields{
+		"slots_processed":    processedSlots,
+		"total_attestations": totalAttestations,
+	}).Info("backfill complete")
+
+	return nil
 }

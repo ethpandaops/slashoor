@@ -15,15 +15,26 @@ type Config struct {
 	Indexer   *indexer.Config   `yaml:"indexer"`
 	Detector  *detector.Config  `yaml:"detector"`
 	Submitter *submitter.Config `yaml:"submitter"`
+
+	// StartSlot, if set via --start-slot flag, rescans from this slot to head on startup.
+	// Useful for rescanning historical attestations.
+	// If 0, uses BackfillSlots instead.
+	StartSlot uint64 `yaml:"-"`
+
+	// BackfillSlots is the number of historical slots to fetch on startup.
+	// Only used if StartSlot is 0.
+	// Default is 64 slots (about 2 epochs).
+	BackfillSlots uint64 `yaml:"backfill_slots"`
 }
 
 // DefaultConfig returns a Config with sensible defaults.
 func DefaultConfig() *Config {
 	return &Config{
-		Beacon:    beacon.DefaultConfig(),
-		Indexer:   indexer.DefaultConfig(),
-		Detector:  detector.DefaultConfig(),
-		Submitter: submitter.DefaultConfig(),
+		Beacon:        beacon.DefaultConfig(),
+		Indexer:       indexer.DefaultConfig(),
+		Detector:      detector.DefaultConfig(),
+		Submitter:     submitter.DefaultConfig(),
+		BackfillSlots: 64,
 	}
 }
 

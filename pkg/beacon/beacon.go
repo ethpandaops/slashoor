@@ -2,6 +2,7 @@ package beacon
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,6 +37,13 @@ type Checkpoint struct {
 	Root  phase0.Root
 }
 
+// Attestation represents an attestation from a block.
+type Attestation struct {
+	AggregationBits []byte
+	Data            *AttestationData
+	Signature       phase0.BLSSignature
+}
+
 // IndexedAttestation represents an attestation with validator indices.
 type IndexedAttestation struct {
 	AttestingIndices []phase0.ValidatorIndex
@@ -49,15 +57,28 @@ type AttesterSlashing struct {
 	Attestation2 *IndexedAttestation
 }
 
+// Committee represents a beacon committee.
+type Committee struct {
+	Index      phase0.CommitteeIndex
+	Slot       phase0.Slot
+	Validators []phase0.ValidatorIndex
+}
+
+// HeadEvent represents a new head event.
+type HeadEvent struct {
+	Slot  phase0.Slot
+	Block phase0.Root
+}
+
 // Service defines the interface for beacon node interactions.
 type Service interface {
 	Start(ctx context.Context) error
 	Stop() error
-	GetGenesisTime(ctx context.Context) (time.Time, error)
-	GetCurrentSlot(ctx context.Context) (phase0.Slot, error)
-	GetAttestations(ctx context.Context, slot phase0.Slot) ([]*IndexedAttestation, error)
+	GetCommittees(ctx context.Context, slot phase0.Slot) ([]*Committee, error)
+	GetBlockAttestations(ctx context.Context, slot phase0.Slot) ([]*Attestation, error)
 	SubmitAttesterSlashing(ctx context.Context, slashing *AttesterSlashing) error
-	SubscribeToAttestations(ctx context.Context, handler func(*IndexedAttestation)) error
+	SubscribeToHeads(ctx context.Context, handler func(*HeadEvent)) error
+	ResolveAttestingValidators(ctx context.Context, att *Attestation) ([]phase0.ValidatorIndex, error)
 }
 
 type node struct {
@@ -68,10 +89,18 @@ type node struct {
 	mu       sync.RWMutex
 }
 
+type committeeKey struct {
+	slot  phase0.Slot
+	index phase0.CommitteeIndex
+}
+
 type service struct {
 	cfg   *Config
 	log   logrus.FieldLogger
 	nodes []*node
+
+	committeeMu    sync.RWMutex
+	committeeCache map[committeeKey][]phase0.ValidatorIndex
 
 	mu     sync.RWMutex
 	cancel context.CancelFunc
@@ -93,9 +122,10 @@ func New(cfg *Config, log logrus.FieldLogger) Service {
 	}
 
 	return &service{
-		cfg:   cfg,
-		log:   log.WithField("package", "beacon"),
-		nodes: nodes,
+		cfg:            cfg,
+		log:            log.WithField("package", "beacon"),
+		nodes:          nodes,
+		committeeCache: make(map[committeeKey][]phase0.ValidatorIndex, 2048),
 	}
 }
 
@@ -104,6 +134,8 @@ func (s *service) Start(ctx context.Context) error {
 	if err := s.cfg.Validate(); err != nil {
 		return fmt.Errorf("invalid config: %w", err)
 	}
+
+	go s.cleanupCommitteeCache(ctx)
 
 	s.log.WithField("endpoints", s.cfg.Endpoints).Info("beacon service started")
 
@@ -129,61 +161,40 @@ func (s *service) Stop() error {
 	return nil
 }
 
-// GetGenesisTime retrieves the genesis time from the beacon node.
-func (s *service) GetGenesisTime(ctx context.Context) (time.Time, error) {
-	var lastErr error
+func (s *service) cleanupCommitteeCache(ctx context.Context) {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
 
-	for _, n := range s.getHealthyNodes() {
-		resp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/genesis", nil)
-		if err != nil {
-			lastErr = err
-			s.markNodeUnhealthy(n)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			s.committeeMu.Lock()
 
-			continue
-		}
+			if len(s.committeeCache) > 1000 {
+				for key := range s.committeeCache {
+					delete(s.committeeCache, key)
 
-		defer resp.Body.Close()
-
-		var result struct {
-			Data struct {
-				GenesisTime string `json:"genesis_time"`
-			} `json:"data"`
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			lastErr = fmt.Errorf("failed to decode genesis response: %w", err)
-
-			continue
-		}
-
-		genesisTime, err := time.Parse(time.RFC3339, result.Data.GenesisTime)
-		if err != nil {
-			var unixTime int64
-			if _, parseErr := fmt.Sscanf(result.Data.GenesisTime, "%d", &unixTime); parseErr == nil {
-				return time.Unix(unixTime, 0), nil
+					if len(s.committeeCache) <= 500 {
+						break
+					}
+				}
 			}
 
-			lastErr = fmt.Errorf("failed to parse genesis time: %w", err)
-
-			continue
+			s.committeeMu.Unlock()
 		}
-
-		return genesisTime, nil
 	}
-
-	if lastErr != nil {
-		return time.Time{}, lastErr
-	}
-
-	return time.Time{}, ErrAllNodesFailed
 }
 
-// GetCurrentSlot retrieves the current slot from the beacon node.
-func (s *service) GetCurrentSlot(ctx context.Context) (phase0.Slot, error) {
+// GetCommittees retrieves beacon committees for a specific slot.
+func (s *service) GetCommittees(ctx context.Context, slot phase0.Slot) ([]*Committee, error) {
+	path := fmt.Sprintf("/eth/v1/beacon/states/head/committees?slot=%d", slot)
+
 	var lastErr error
 
 	for _, n := range s.getHealthyNodes() {
-		resp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/headers/head", nil)
+		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil)
 		if err != nil {
 			lastErr = err
 			s.markNodeUnhealthy(n)
@@ -194,43 +205,75 @@ func (s *service) GetCurrentSlot(ctx context.Context) (phase0.Slot, error) {
 		defer resp.Body.Close()
 
 		var result struct {
-			Data struct {
-				Header struct {
-					Message struct {
-						Slot string `json:"slot"`
-					} `json:"message"`
-				} `json:"header"`
+			Data []struct {
+				Index      string   `json:"index"`
+				Slot       string   `json:"slot"`
+				Validators []string `json:"validators"`
 			} `json:"data"`
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			lastErr = fmt.Errorf("failed to decode header response: %w", err)
+			lastErr = fmt.Errorf("failed to decode committees response: %w", err)
 
 			continue
 		}
 
-		var slot uint64
-		if _, err := fmt.Sscanf(result.Data.Header.Message.Slot, "%d", &slot); err != nil {
-			lastErr = fmt.Errorf("failed to parse slot: %w", err)
+		committees := make([]*Committee, 0, len(result.Data))
 
-			continue
+		for _, c := range result.Data {
+			idx, _ := parseUint64(c.Index)
+			cSlot, _ := parseUint64(c.Slot)
+
+			validators := make([]phase0.ValidatorIndex, 0, len(c.Validators))
+			for _, v := range c.Validators {
+				vidx, _ := parseUint64(v)
+				validators = append(validators, phase0.ValidatorIndex(vidx))
+			}
+
+			committee := &Committee{
+				Index:      phase0.CommitteeIndex(idx),
+				Slot:       phase0.Slot(cSlot),
+				Validators: validators,
+			}
+
+			committees = append(committees, committee)
+
+			s.cacheCommittee(committee)
 		}
 
-		return phase0.Slot(slot), nil
+		return committees, nil
 	}
 
 	if lastErr != nil {
-		return 0, lastErr
+		return nil, lastErr
 	}
 
-	return 0, ErrAllNodesFailed
+	return nil, ErrAllNodesFailed
 }
 
-// GetAttestations retrieves attestations from a specific slot.
-func (s *service) GetAttestations(
+func (s *service) cacheCommittee(c *Committee) {
+	s.committeeMu.Lock()
+	defer s.committeeMu.Unlock()
+
+	key := committeeKey{slot: c.Slot, index: c.Index}
+	s.committeeCache[key] = c.Validators
+}
+
+func (s *service) getCachedCommittee(
+	slot phase0.Slot,
+	index phase0.CommitteeIndex,
+) []phase0.ValidatorIndex {
+	s.committeeMu.RLock()
+	defer s.committeeMu.RUnlock()
+
+	return s.committeeCache[committeeKey{slot: slot, index: index}]
+}
+
+// GetBlockAttestations retrieves attestations from a specific block.
+func (s *service) GetBlockAttestations(
 	ctx context.Context,
 	slot phase0.Slot,
-) ([]*IndexedAttestation, error) {
+) ([]*Attestation, error) {
 	path := fmt.Sprintf("/eth/v1/beacon/blocks/%d/attestations", slot)
 
 	var lastErr error
@@ -260,12 +303,12 @@ func (s *service) GetAttestations(
 			continue
 		}
 
-		attestations := make([]*IndexedAttestation, 0, len(result.Data))
+		attestations := make([]*Attestation, 0, len(result.Data))
 
 		for _, raw := range result.Data {
 			att, err := s.parseAttestation(raw)
 			if err != nil {
-				s.log.WithError(err).Warn("failed to parse attestation")
+				s.log.WithError(err).Debug("failed to parse attestation")
 
 				continue
 			}
@@ -283,9 +326,45 @@ func (s *service) GetAttestations(
 	return nil, ErrAllNodesFailed
 }
 
+// ResolveAttestingValidators resolves the attesting validators for an attestation.
+func (s *service) ResolveAttestingValidators(
+	ctx context.Context,
+	att *Attestation,
+) ([]phase0.ValidatorIndex, error) {
+	committee := s.getCachedCommittee(att.Data.Slot, att.Data.Index)
+
+	if committee == nil {
+		if _, err := s.GetCommittees(ctx, att.Data.Slot); err != nil {
+			return nil, fmt.Errorf("failed to fetch committees: %w", err)
+		}
+
+		committee = s.getCachedCommittee(att.Data.Slot, att.Data.Index)
+		if committee == nil {
+			return nil, fmt.Errorf("committee not found for slot %d index %d", att.Data.Slot, att.Data.Index)
+		}
+	}
+
+	validators := make([]phase0.ValidatorIndex, 0, len(committee))
+
+	for i, validatorIdx := range committee {
+		if i >= len(att.AggregationBits)*8 {
+			break
+		}
+
+		byteIdx := i / 8
+		bitIdx := i % 8
+
+		if att.AggregationBits[byteIdx]&(1<<bitIdx) != 0 {
+			validators = append(validators, validatorIdx)
+		}
+	}
+
+	return validators, nil
+}
+
 // SubmitAttesterSlashing submits an attester slashing to all beacon nodes.
 func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *AttesterSlashing) error {
-	body, err := json.Marshal(slashing)
+	body, err := s.marshalSlashing(slashing)
 	if err != nil {
 		return fmt.Errorf("failed to marshal slashing: %w", err)
 	}
@@ -309,6 +388,11 @@ func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *Attester
 			successCount++
 
 			s.log.WithField("endpoint", n.endpoint).Debug("submitted slashing to node")
+		} else {
+			s.log.WithFields(logrus.Fields{
+				"endpoint": n.endpoint,
+				"status":   resp.StatusCode,
+			}).Warn("failed to submit slashing")
 		}
 	}
 
@@ -325,22 +409,95 @@ func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *Attester
 	return nil
 }
 
-// SubscribeToAttestations subscribes to attestation events from all beacon nodes.
-func (s *service) SubscribeToAttestations(
+func (s *service) marshalSlashing(slashing *AttesterSlashing) ([]byte, error) {
+	type apiAttestation struct {
+		AttestingIndices []string `json:"attesting_indices"`
+		Data             struct {
+			Slot            string `json:"slot"`
+			Index           string `json:"index"`
+			BeaconBlockRoot string `json:"beacon_block_root"`
+			Source          struct {
+				Epoch string `json:"epoch"`
+				Root  string `json:"root"`
+			} `json:"source"`
+			Target struct {
+				Epoch string `json:"epoch"`
+				Root  string `json:"root"`
+			} `json:"target"`
+		} `json:"data"`
+		Signature string `json:"signature"`
+	}
+
+	toAPI := func(att *IndexedAttestation) apiAttestation {
+		indices := make([]string, 0, len(att.AttestingIndices))
+		for _, idx := range att.AttestingIndices {
+			indices = append(indices, fmt.Sprintf("%d", idx))
+		}
+
+		return apiAttestation{
+			AttestingIndices: indices,
+			Data: struct {
+				Slot            string `json:"slot"`
+				Index           string `json:"index"`
+				BeaconBlockRoot string `json:"beacon_block_root"`
+				Source          struct {
+					Epoch string `json:"epoch"`
+					Root  string `json:"root"`
+				} `json:"source"`
+				Target struct {
+					Epoch string `json:"epoch"`
+					Root  string `json:"root"`
+				} `json:"target"`
+			}{
+				Slot:            fmt.Sprintf("%d", att.Data.Slot),
+				Index:           fmt.Sprintf("%d", att.Data.Index),
+				BeaconBlockRoot: fmt.Sprintf("0x%x", att.Data.BeaconBlockRoot),
+				Source: struct {
+					Epoch string `json:"epoch"`
+					Root  string `json:"root"`
+				}{
+					Epoch: fmt.Sprintf("%d", att.Data.Source.Epoch),
+					Root:  fmt.Sprintf("0x%x", att.Data.Source.Root),
+				},
+				Target: struct {
+					Epoch string `json:"epoch"`
+					Root  string `json:"root"`
+				}{
+					Epoch: fmt.Sprintf("%d", att.Data.Target.Epoch),
+					Root:  fmt.Sprintf("0x%x", att.Data.Target.Root),
+				},
+			},
+			Signature: fmt.Sprintf("0x%x", att.Signature),
+		}
+	}
+
+	apiSlashing := struct {
+		Attestation1 apiAttestation `json:"attestation_1"`
+		Attestation2 apiAttestation `json:"attestation_2"`
+	}{
+		Attestation1: toAPI(slashing.Attestation1),
+		Attestation2: toAPI(slashing.Attestation2),
+	}
+
+	return json.Marshal(apiSlashing)
+}
+
+// SubscribeToHeads subscribes to head events from all beacon nodes.
+func (s *service) SubscribeToHeads(
 	ctx context.Context,
-	handler func(*IndexedAttestation),
+	handler func(*HeadEvent),
 ) error {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
-	seen := newAttestationDeduplicator()
+	seen := newHeadDeduplicator()
 
-	wrappedHandler := func(att *IndexedAttestation) {
-		if seen.isDuplicate(att) {
+	wrappedHandler := func(event *HeadEvent) {
+		if seen.isDuplicate(event) {
 			return
 		}
 
-		handler(att)
+		handler(event)
 	}
 
 	for _, n := range s.nodes {
@@ -363,42 +520,45 @@ func (s *service) SubscribeToAttestations(
 func (s *service) subscribeNode(
 	ctx context.Context,
 	n *node,
-	handler func(*IndexedAttestation),
+	handler func(*HeadEvent),
 ) {
 	log := s.log.WithField("endpoint", n.endpoint)
 
-	for {
-		select {
-		case <-ctx.Done():
+	n.stream = NewStream(n.endpoint, log)
+
+	err := n.stream.Subscribe(ctx, "head", func(data []byte) {
+		event, err := s.parseHeadEvent(data)
+		if err != nil {
+			log.WithError(err).Debug("failed to parse head event")
+
 			return
-		default:
 		}
 
-		n.stream = NewStream(n.endpoint, s.log)
+		handler(event)
+	})
 
-		err := n.stream.Subscribe(ctx, "attestation", func(data []byte) {
-			att, err := s.parseAttestationEvent(data)
-			if err != nil {
-				log.WithError(err).Debug("failed to parse attestation event")
-
-				return
-			}
-
-			handler(att)
-		})
-
-		if err != nil && ctx.Err() == nil {
-			log.WithError(err).Warn("SSE subscription ended, reconnecting")
-			s.markNodeUnhealthy(n)
-
-			select {
-			case <-ctx.Done():
-				return
-			case <-time.After(5 * time.Second):
-				s.markNodeHealthy(n)
-			}
-		}
+	if err != nil && ctx.Err() == nil {
+		log.WithError(err).Warn("head subscription ended")
 	}
+}
+
+func (s *service) parseHeadEvent(data []byte) (*HeadEvent, error) {
+	var event struct {
+		Slot  string `json:"slot"`
+		Block string `json:"block"`
+	}
+
+	if err := json.Unmarshal(data, &event); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal head event: %w", err)
+	}
+
+	slot, _ := parseUint64(event.Slot)
+	block, _ := parseRoot(event.Block)
+
+	return &HeadEvent{
+		Slot:  phase0.Slot(slot),
+		Block: block,
+	}, nil
 }
 
 func (s *service) getHealthyNodes() []*node {
@@ -472,7 +632,7 @@ func (s *service) doNodeRequest(
 	return resp, nil
 }
 
-func (s *service) parseAttestation(raw json.RawMessage) (*IndexedAttestation, error) {
+func (s *service) parseAttestation(raw json.RawMessage) (*Attestation, error) {
 	var att struct {
 		AggregationBits string `json:"aggregation_bits"`
 		Data            struct {
@@ -504,9 +664,10 @@ func (s *service) parseAttestation(raw json.RawMessage) (*IndexedAttestation, er
 	sourceRoot, _ := parseRoot(att.Data.Source.Root)
 	targetRoot, _ := parseRoot(att.Data.Target.Root)
 	sig, _ := parseSignature(att.Signature)
+	aggBits, _ := parseAggregationBits(att.AggregationBits)
 
-	return &IndexedAttestation{
-		AttestingIndices: []phase0.ValidatorIndex{},
+	return &Attestation{
+		AggregationBits: aggBits,
 		Data: &AttestationData{
 			Slot:            phase0.Slot(slot),
 			Index:           phase0.CommitteeIndex(index),
@@ -524,8 +685,16 @@ func (s *service) parseAttestation(raw json.RawMessage) (*IndexedAttestation, er
 	}, nil
 }
 
-func (s *service) parseAttestationEvent(data []byte) (*IndexedAttestation, error) {
-	return s.parseAttestation(data)
+func parseAggregationBits(s string) ([]byte, error) {
+	if len(s) < 2 {
+		return nil, errors.New("aggregation bits too short")
+	}
+
+	if s[:2] == "0x" {
+		s = s[2:]
+	}
+
+	return hex.DecodeString(s)
 }
 
 type readCloser struct {
@@ -559,21 +728,20 @@ func parseRoot(s string) (phase0.Root, error) {
 		return root, errors.New("root too short")
 	}
 
-	s = s[2:]
+	if s[:2] == "0x" {
+		s = s[2:]
+	}
+
 	if len(s) != 64 {
 		return root, errors.New("invalid root length")
 	}
 
-	for i := 0; i < 32; i++ {
-		var b byte
-
-		_, err := fmt.Sscanf(s[i*2:i*2+2], "%02x", &b)
-		if err != nil {
-			return root, err
-		}
-
-		root[i] = b
+	bytes, err := hex.DecodeString(s)
+	if err != nil {
+		return root, err
 	}
+
+	copy(root[:], bytes)
 
 	return root, nil
 }
@@ -585,34 +753,33 @@ func parseSignature(s string) (phase0.BLSSignature, error) {
 		return sig, errors.New("signature too short")
 	}
 
-	s = s[2:]
+	if s[:2] == "0x" {
+		s = s[2:]
+	}
+
 	if len(s) != 192 {
 		return sig, errors.New("invalid signature length")
 	}
 
-	for i := 0; i < 96; i++ {
-		var b byte
-
-		_, err := fmt.Sscanf(s[i*2:i*2+2], "%02x", &b)
-		if err != nil {
-			return sig, err
-		}
-
-		sig[i] = b
+	bytes, err := hex.DecodeString(s)
+	if err != nil {
+		return sig, err
 	}
+
+	copy(sig[:], bytes)
 
 	return sig, nil
 }
 
-// attestationDeduplicator tracks seen attestations to prevent duplicates from multiple nodes.
-type attestationDeduplicator struct {
+// headDeduplicator tracks seen head events to prevent duplicates from multiple nodes.
+type headDeduplicator struct {
 	mu   sync.Mutex
-	seen map[string]time.Time
+	seen map[phase0.Slot]time.Time
 }
 
-func newAttestationDeduplicator() *attestationDeduplicator {
-	d := &attestationDeduplicator{
-		seen: make(map[string]time.Time, 4096),
+func newHeadDeduplicator() *headDeduplicator {
+	d := &headDeduplicator{
+		seen: make(map[phase0.Slot]time.Time, 64),
 	}
 
 	go d.cleanup()
@@ -620,38 +787,31 @@ func newAttestationDeduplicator() *attestationDeduplicator {
 	return d
 }
 
-func (d *attestationDeduplicator) isDuplicate(att *IndexedAttestation) bool {
-	key := fmt.Sprintf("%d:%d:%d:%x",
-		att.Data.Slot,
-		att.Data.Source.Epoch,
-		att.Data.Target.Epoch,
-		att.Signature[:8],
-	)
-
+func (d *headDeduplicator) isDuplicate(event *HeadEvent) bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	if _, exists := d.seen[key]; exists {
+	if _, exists := d.seen[event.Slot]; exists {
 		return true
 	}
 
-	d.seen[key] = time.Now()
+	d.seen[event.Slot] = time.Now()
 
 	return false
 }
 
-func (d *attestationDeduplicator) cleanup() {
-	ticker := time.NewTicker(5 * time.Minute)
+func (d *headDeduplicator) cleanup() {
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 
 	for range ticker.C {
 		d.mu.Lock()
 
-		cutoff := time.Now().Add(-10 * time.Minute)
+		cutoff := time.Now().Add(-2 * time.Minute)
 
-		for key, ts := range d.seen {
+		for slot, ts := range d.seen {
 			if ts.Before(cutoff) {
-				delete(d.seen, key)
+				delete(d.seen, slot)
 			}
 		}
 

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/attestantio/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 
 	"github.com/slashoor/slashoor/pkg/beacon"
@@ -18,13 +19,14 @@ type SlashingHandler func(*beacon.AttesterSlashing)
 type Service interface {
 	Start(ctx context.Context) error
 	Stop() error
-	HandleViolation(violation *indexer.SlashingViolation)
+	HandleCandidate(ctx context.Context, candidate *indexer.SlashingCandidate)
 	OnSlashing(handler SlashingHandler)
 }
 
 type service struct {
-	cfg *Config
-	log logrus.FieldLogger
+	cfg    *Config
+	log    logrus.FieldLogger
+	beacon beacon.Service
 
 	mu               sync.RWMutex
 	slashingHandlers []SlashingHandler
@@ -32,10 +34,11 @@ type service struct {
 }
 
 // New creates a new detector service.
-func New(cfg *Config, log logrus.FieldLogger) Service {
+func New(cfg *Config, beacon beacon.Service, log logrus.FieldLogger) Service {
 	return &service{
 		cfg:              cfg,
 		log:              log.WithField("package", "detector"),
+		beacon:           beacon,
 		slashingHandlers: make([]SlashingHandler, 0, 4),
 	}
 }
@@ -66,15 +69,44 @@ func (s *service) OnSlashing(handler SlashingHandler) {
 	s.slashingHandlers = append(s.slashingHandlers, handler)
 }
 
-// HandleViolation processes a slashing violation and creates a proof.
-func (s *service) HandleViolation(violation *indexer.SlashingViolation) {
+// HandleCandidate processes a slashing candidate and creates a proof if valid.
+func (s *service) HandleCandidate(ctx context.Context, candidate *indexer.SlashingCandidate) {
 	if !s.cfg.Enabled {
 		return
 	}
 
-	slashing := s.createSlashingProof(violation)
-	if slashing == nil {
+	validators1, err := s.beacon.ResolveAttestingValidators(ctx, candidate.Attestation1)
+	if err != nil {
+		s.log.WithError(err).Debug("failed to resolve validators for attestation 1")
+
 		return
+	}
+
+	validators2, err := s.beacon.ResolveAttestingValidators(ctx, candidate.Attestation2)
+	if err != nil {
+		s.log.WithError(err).Debug("failed to resolve validators for attestation 2")
+
+		return
+	}
+
+	overlap := findOverlappingValidators(validators1, validators2)
+	if len(overlap) == 0 {
+		s.log.Debug("no overlapping validators in slashing candidate")
+
+		return
+	}
+
+	slashing := &beacon.AttesterSlashing{
+		Attestation1: &beacon.IndexedAttestation{
+			AttestingIndices: overlap,
+			Data:             candidate.Attestation1.Data,
+			Signature:        candidate.Attestation1.Signature,
+		},
+		Attestation2: &beacon.IndexedAttestation{
+			AttestingIndices: overlap,
+			Data:             candidate.Attestation2.Data,
+			Signature:        candidate.Attestation2.Signature,
+		},
 	}
 
 	s.mu.Lock()
@@ -82,80 +114,28 @@ func (s *service) HandleViolation(violation *indexer.SlashingViolation) {
 	s.mu.Unlock()
 
 	s.log.WithFields(logrus.Fields{
-		"type":          violation.Type.String(),
-		"validator_idx": violation.ValidatorIdx,
+		"type":       candidate.Type.String(),
+		"validators": len(overlap),
 	}).Info("created slashing proof")
 
 	s.notifyHandlers(slashing)
 }
 
-func (s *service) createSlashingProof(
-	violation *indexer.SlashingViolation,
-) *beacon.AttesterSlashing {
-	att1 := violation.Attestation1
-	att2 := violation.Attestation2
-
-	if att1 == nil || att2 == nil {
-		s.log.Warn("cannot create slashing proof: missing attestation data")
-
-		return nil
+func findOverlappingValidators(v1, v2 []phase0.ValidatorIndex) []phase0.ValidatorIndex {
+	set := make(map[phase0.ValidatorIndex]struct{}, len(v1))
+	for _, v := range v1 {
+		set[v] = struct{}{}
 	}
 
-	slashing := &beacon.AttesterSlashing{
-		Attestation1: att1,
-		Attestation2: att2,
-	}
+	overlap := make([]phase0.ValidatorIndex, 0)
 
-	if !s.validateSlashing(slashing) {
-		return nil
-	}
-
-	return slashing
-}
-
-func (s *service) validateSlashing(slashing *beacon.AttesterSlashing) bool {
-	att1 := slashing.Attestation1
-	att2 := slashing.Attestation2
-
-	hasOverlap := false
-
-	for _, idx1 := range att1.AttestingIndices {
-		for _, idx2 := range att2.AttestingIndices {
-			if idx1 == idx2 {
-				hasOverlap = true
-
-				break
-			}
-		}
-
-		if hasOverlap {
-			break
+	for _, v := range v2 {
+		if _, exists := set[v]; exists {
+			overlap = append(overlap, v)
 		}
 	}
 
-	if !hasOverlap {
-		s.log.Debug("no overlapping validators in slashing proof")
-
-		return false
-	}
-
-	if isDoubleVote(att1, att2) || isSurroundVote(att1, att2) || isSurroundVote(att2, att1) {
-		return true
-	}
-
-	s.log.Debug("slashing proof does not contain valid violation")
-
-	return false
-}
-
-func isDoubleVote(att1, att2 *beacon.IndexedAttestation) bool {
-	return att1.Data.Target.Epoch == att2.Data.Target.Epoch &&
-		att1.Data.Target.Root != att2.Data.Target.Root
-}
-
-func isSurroundVote(att1, att2 *beacon.IndexedAttestation) bool {
-	return att1.Data.Source.Epoch < att2.Data.Source.Epoch &&
-		att2.Data.Target.Epoch < att1.Data.Target.Epoch
+	return overlap
 }
 
 func (s *service) notifyHandlers(slashing *beacon.AttesterSlashing) {

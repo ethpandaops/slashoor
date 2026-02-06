@@ -29,6 +29,7 @@ type service struct {
 	submitter submitter.Service
 
 	wg     sync.WaitGroup
+	ctx    context.Context
 	cancel context.CancelFunc
 }
 
@@ -42,7 +43,7 @@ func New(cfg *Config, log logrus.FieldLogger) (Service, error) {
 
 	beaconSvc := beacon.New(cfg.Beacon, log)
 	indexerSvc := indexer.New(cfg.Indexer, log)
-	detectorSvc := detector.New(cfg.Detector, log)
+	detectorSvc := detector.New(cfg.Detector, beaconSvc, log)
 	submitterSvc := submitter.New(cfg.Submitter, beaconSvc, log)
 
 	return &service{
@@ -57,29 +58,28 @@ func New(cfg *Config, log logrus.FieldLogger) (Service, error) {
 
 // Start initializes and starts all services.
 func (s *service) Start(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
+	s.ctx, s.cancel = context.WithCancel(ctx)
 
-	if err := s.beacon.Start(ctx); err != nil {
+	if err := s.beacon.Start(s.ctx); err != nil {
 		return fmt.Errorf("failed to start beacon service: %w", err)
 	}
 
-	if err := s.indexer.Start(ctx); err != nil {
+	if err := s.indexer.Start(s.ctx); err != nil {
 		return fmt.Errorf("failed to start indexer service: %w", err)
 	}
 
-	if err := s.detector.Start(ctx); err != nil {
+	if err := s.detector.Start(s.ctx); err != nil {
 		return fmt.Errorf("failed to start detector service: %w", err)
 	}
 
-	if err := s.submitter.Start(ctx); err != nil {
+	if err := s.submitter.Start(s.ctx); err != nil {
 		return fmt.Errorf("failed to start submitter service: %w", err)
 	}
 
 	s.wireServices()
 
-	if err := s.subscribeToAttestations(ctx); err != nil {
-		return fmt.Errorf("failed to subscribe to attestations: %w", err)
+	if err := s.subscribeToHeads(); err != nil {
+		return fmt.Errorf("failed to subscribe to heads: %w", err)
 	}
 
 	s.log.Info("coordinator started")
@@ -125,8 +125,8 @@ func (s *service) Stop() error {
 }
 
 func (s *service) wireServices() {
-	s.indexer.OnViolation(func(violation *indexer.SlashingViolation) {
-		s.detector.HandleViolation(violation)
+	s.indexer.OnCandidate(func(candidate *indexer.SlashingCandidate) {
+		s.detector.HandleCandidate(s.ctx, candidate)
 	})
 
 	s.detector.OnSlashing(func(slashing *beacon.AttesterSlashing) {
@@ -134,18 +134,38 @@ func (s *service) wireServices() {
 	})
 }
 
-func (s *service) subscribeToAttestations(ctx context.Context) error {
+func (s *service) subscribeToHeads() error {
 	s.wg.Add(1)
 
 	go func() {
 		defer s.wg.Done()
 
-		if err := s.beacon.SubscribeToAttestations(ctx, func(att *beacon.IndexedAttestation) {
-			s.indexer.ProcessAttestation(att)
-		}); err != nil {
-			s.log.WithError(err).Error("attestation subscription failed")
+		if err := s.beacon.SubscribeToHeads(s.ctx, s.handleHead); err != nil {
+			if s.ctx.Err() == nil {
+				s.log.WithError(err).Error("head subscription failed")
+			}
 		}
 	}()
 
 	return nil
+}
+
+func (s *service) handleHead(event *beacon.HeadEvent) {
+	s.log.WithField("slot", event.Slot).Debug("new head received")
+
+	attestations, err := s.beacon.GetBlockAttestations(s.ctx, event.Slot)
+	if err != nil {
+		s.log.WithError(err).WithField("slot", event.Slot).Warn("failed to get block attestations")
+
+		return
+	}
+
+	s.log.WithFields(logrus.Fields{
+		"slot":         event.Slot,
+		"attestations": len(attestations),
+	}).Debug("processing block attestations")
+
+	for _, att := range attestations {
+		s.indexer.ProcessAttestation(att)
+	}
 }

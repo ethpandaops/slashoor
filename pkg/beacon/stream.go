@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/sirupsen/logrus"
 )
@@ -30,25 +31,45 @@ func NewStream(endpoint string, log logrus.FieldLogger) *Stream {
 	}
 }
 
-// Subscribe subscribes to an SSE event topic.
+// Subscribe subscribes to an SSE event topic. This method blocks until the
+// context is cancelled or an unrecoverable error occurs.
 func (s *Stream) Subscribe(ctx context.Context, topic string, handler func([]byte)) error {
 	ctx, cancel := context.WithCancel(ctx)
 	s.cancel = cancel
 
 	url := fmt.Sprintf("%s/eth/v1/events?topics=%s", s.endpoint, topic)
 
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return fmt.Errorf("failed to create SSE request: %w", err)
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+		if err != nil {
+			return fmt.Errorf("failed to create SSE request: %w", err)
+		}
+
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Connection", "keep-alive")
+
+		if err := s.connectAndRead(ctx, req, handler); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+
+			s.log.WithError(err).Warn("SSE connection error, reconnecting")
+
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(5 * time.Second):
+				continue
+			}
+		}
 	}
-
-	req.Header.Set("Accept", "text/event-stream")
-	req.Header.Set("Cache-Control", "no-cache")
-	req.Header.Set("Connection", "keep-alive")
-
-	go s.handleStream(ctx, req, handler)
-
-	return nil
 }
 
 // Close closes the SSE stream.
@@ -67,32 +88,12 @@ func (s *Stream) Close() {
 	}
 }
 
-func (s *Stream) handleStream(ctx context.Context, req *http.Request, handler func([]byte)) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		if err := s.connectAndRead(ctx, req, handler); err != nil {
-			s.log.WithError(err).Warn("SSE connection error, reconnecting")
-		}
-
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-	}
-}
-
 func (s *Stream) connectAndRead(
 	ctx context.Context,
 	req *http.Request,
 	handler func([]byte),
 ) error {
-	resp, err := s.client.Do(req.Clone(ctx))
+	resp, err := s.client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to connect to SSE: %w", err)
 	}

@@ -11,12 +11,11 @@ import (
 	"github.com/slashoor/slashoor/pkg/beacon"
 )
 
-// SlashingViolation represents a detected slashing violation.
-type SlashingViolation struct {
+// SlashingCandidate represents a potential slashing between two attestations.
+type SlashingCandidate struct {
 	Type         ViolationType
-	ValidatorIdx phase0.ValidatorIndex
-	Attestation1 *beacon.IndexedAttestation
-	Attestation2 *beacon.IndexedAttestation
+	Attestation1 *beacon.Attestation
+	Attestation2 *beacon.Attestation
 }
 
 // ViolationType represents the type of slashing violation.
@@ -38,25 +37,42 @@ func (v ViolationType) String() string {
 	}
 }
 
-// ViolationHandler is called when a slashing violation is detected.
-type ViolationHandler func(*SlashingViolation)
+// CandidateHandler is called when a slashing candidate is detected.
+type CandidateHandler func(*SlashingCandidate)
 
 // Service defines the interface for the indexer.
 type Service interface {
 	Start(ctx context.Context) error
 	Stop() error
-	ProcessAttestation(att *beacon.IndexedAttestation)
-	OnViolation(handler ViolationHandler)
+	ProcessAttestation(att *beacon.Attestation)
+	OnCandidate(handler CandidateHandler)
+}
+
+// attestationKey uniquely identifies attestation data for double vote detection.
+type attestationKey struct {
+	slot        phase0.Slot
+	index       phase0.CommitteeIndex
+	targetEpoch phase0.Epoch
+}
+
+// storedAttestation holds attestation data for slashing detection.
+type storedAttestation struct {
+	attestation *beacon.Attestation
+	sourceEpoch phase0.Epoch
+	targetEpoch phase0.Epoch
+	targetRoot  phase0.Root
+	signature   phase0.BLSSignature
 }
 
 type service struct {
-	cfg            *Config
-	log            logrus.FieldLogger
-	epochBounds    *EpochBounds
-	validatorStore *ValidatorStore
+	cfg *Config
+	log logrus.FieldLogger
 
-	mu                sync.RWMutex
-	violationHandlers []ViolationHandler
+	mu           sync.RWMutex
+	attestations map[attestationKey][]*storedAttestation
+	epochBounds  *EpochBounds
+
+	candidateHandlers []CandidateHandler
 	processedCount    uint64
 }
 
@@ -65,9 +81,9 @@ func New(cfg *Config, log logrus.FieldLogger) Service {
 	return &service{
 		cfg:               cfg,
 		log:               log.WithField("package", "indexer"),
+		attestations:      make(map[attestationKey][]*storedAttestation, 4096),
 		epochBounds:       NewEpochBounds(),
-		validatorStore:    NewValidatorStore(),
-		violationHandlers: make([]ViolationHandler, 0, 4),
+		candidateHandlers: make([]CandidateHandler, 0, 4),
 	}
 }
 
@@ -89,22 +105,24 @@ func (s *service) Stop() error {
 	return nil
 }
 
-// OnViolation registers a handler for slashing violations.
-func (s *service) OnViolation(handler ViolationHandler) {
+// OnCandidate registers a handler for slashing candidates.
+func (s *service) OnCandidate(handler CandidateHandler) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.violationHandlers = append(s.violationHandlers, handler)
+	s.candidateHandlers = append(s.candidateHandlers, handler)
 }
 
 // ProcessAttestation processes an attestation and checks for slashing violations.
-func (s *service) ProcessAttestation(att *beacon.IndexedAttestation) {
+func (s *service) ProcessAttestation(att *beacon.Attestation) {
 	s.mu.Lock()
 	s.processedCount++
 	s.mu.Unlock()
 
 	sourceEpoch := att.Data.Source.Epoch
 	targetEpoch := att.Data.Target.Epoch
+
+	s.checkDoubleVote(att)
 
 	if s.epochBounds.CheckSurroundVote(sourceEpoch, targetEpoch) {
 		s.checkSurroundViolations(att)
@@ -114,81 +132,100 @@ func (s *service) ProcessAttestation(att *beacon.IndexedAttestation) {
 		s.checkSurroundedViolations(att)
 	}
 
-	s.checkDoubleVotes(att)
-
 	s.epochBounds.Update(sourceEpoch, targetEpoch)
-	s.validatorStore.Add(att)
+	s.storeAttestation(att)
 }
 
-func (s *service) checkDoubleVotes(att *beacon.IndexedAttestation) {
-	for _, validatorIdx := range att.AttestingIndices {
-		existing := s.validatorStore.FindDoubleVote(
-			validatorIdx,
-			att.Data.Target.Epoch,
-			att.Data.Target.Root,
-		)
-		if existing != nil {
-			s.reportViolation(&SlashingViolation{
-				Type:         ViolationDoubleVote,
-				ValidatorIdx: validatorIdx,
-				Attestation1: existing.Attestation,
-				Attestation2: att,
-			})
-		}
+func (s *service) storeAttestation(att *beacon.Attestation) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	key := attestationKey{
+		slot:        att.Data.Slot,
+		index:       att.Data.Index,
+		targetEpoch: att.Data.Target.Epoch,
 	}
-}
 
-func (s *service) checkSurroundViolations(att *beacon.IndexedAttestation) {
-	for _, validatorIdx := range att.AttestingIndices {
-		existing := s.validatorStore.FindSurroundedVote(
-			validatorIdx,
-			att.Data.Source.Epoch,
-			att.Data.Target.Epoch,
-		)
-		if existing != nil {
-			s.reportViolation(&SlashingViolation{
-				Type:         ViolationSurroundVote,
-				ValidatorIdx: validatorIdx,
-				Attestation1: existing.Attestation,
-				Attestation2: att,
-			})
-		}
+	stored := &storedAttestation{
+		attestation: att,
+		sourceEpoch: att.Data.Source.Epoch,
+		targetEpoch: att.Data.Target.Epoch,
+		targetRoot:  att.Data.Target.Root,
+		signature:   att.Signature,
 	}
+
+	s.attestations[key] = append(s.attestations[key], stored)
 }
 
-func (s *service) checkSurroundedViolations(att *beacon.IndexedAttestation) {
-	for _, validatorIdx := range att.AttestingIndices {
-		existing := s.validatorStore.FindSurroundingVote(
-			validatorIdx,
-			att.Data.Source.Epoch,
-			att.Data.Target.Epoch,
-		)
-		if existing != nil {
-			s.reportViolation(&SlashingViolation{
-				Type:         ViolationSurroundVote,
-				ValidatorIdx: validatorIdx,
-				Attestation1: att,
-				Attestation2: existing.Attestation,
-			})
-		}
-	}
-}
-
-func (s *service) reportViolation(violation *SlashingViolation) {
-	s.log.WithFields(logrus.Fields{
-		"type":          violation.Type.String(),
-		"validator_idx": violation.ValidatorIdx,
-		"source1":       violation.Attestation1.Data.Source.Epoch,
-		"target1":       violation.Attestation1.Data.Target.Epoch,
-		"source2":       violation.Attestation2.Data.Source.Epoch,
-		"target2":       violation.Attestation2.Data.Target.Epoch,
-	}).Warn("slashing violation detected")
-
+func (s *service) checkDoubleVote(att *beacon.Attestation) {
 	s.mu.RLock()
-	handlers := s.violationHandlers
-	s.mu.RUnlock()
+	defer s.mu.RUnlock()
+
+	key := attestationKey{
+		slot:        att.Data.Slot,
+		index:       att.Data.Index,
+		targetEpoch: att.Data.Target.Epoch,
+	}
+
+	existing := s.attestations[key]
+
+	for _, stored := range existing {
+		if stored.targetRoot != att.Data.Target.Root && stored.signature != att.Signature {
+			s.reportCandidate(&SlashingCandidate{
+				Type:         ViolationDoubleVote,
+				Attestation1: stored.attestation,
+				Attestation2: att,
+			})
+		}
+	}
+}
+
+func (s *service) checkSurroundViolations(att *beacon.Attestation) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, storedList := range s.attestations {
+		for _, stored := range storedList {
+			if att.Data.Source.Epoch < stored.sourceEpoch && stored.targetEpoch < att.Data.Target.Epoch {
+				s.reportCandidate(&SlashingCandidate{
+					Type:         ViolationSurroundVote,
+					Attestation1: att,
+					Attestation2: stored.attestation,
+				})
+			}
+		}
+	}
+}
+
+func (s *service) checkSurroundedViolations(att *beacon.Attestation) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	for _, storedList := range s.attestations {
+		for _, stored := range storedList {
+			if stored.sourceEpoch < att.Data.Source.Epoch && att.Data.Target.Epoch < stored.targetEpoch {
+				s.reportCandidate(&SlashingCandidate{
+					Type:         ViolationSurroundVote,
+					Attestation1: stored.attestation,
+					Attestation2: att,
+				})
+			}
+		}
+	}
+}
+
+func (s *service) reportCandidate(candidate *SlashingCandidate) {
+	s.log.WithFields(logrus.Fields{
+		"type":    candidate.Type.String(),
+		"source1": candidate.Attestation1.Data.Source.Epoch,
+		"target1": candidate.Attestation1.Data.Target.Epoch,
+		"source2": candidate.Attestation2.Data.Source.Epoch,
+		"target2": candidate.Attestation2.Data.Target.Epoch,
+	}).Warn("slashing candidate detected")
+
+	handlers := s.candidateHandlers
 
 	for _, handler := range handlers {
-		handler(violation)
+		handler(candidate)
 	}
 }

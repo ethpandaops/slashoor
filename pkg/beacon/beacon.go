@@ -70,6 +70,34 @@ type HeadEvent struct {
 	Block phase0.Root
 }
 
+// BlockEvent represents a new block event from SSE.
+type BlockEvent struct {
+	Slot          phase0.Slot
+	Block         phase0.Root
+	ProposerIndex phase0.ValidatorIndex
+}
+
+// BeaconBlockHeader represents a beacon block header.
+type BeaconBlockHeader struct {
+	Slot          phase0.Slot
+	ProposerIndex phase0.ValidatorIndex
+	ParentRoot    phase0.Root
+	StateRoot     phase0.Root
+	BodyRoot      phase0.Root
+}
+
+// SignedBeaconBlockHeader represents a signed beacon block header.
+type SignedBeaconBlockHeader struct {
+	Message   *BeaconBlockHeader
+	Signature phase0.BLSSignature
+}
+
+// ProposerSlashing represents a proposer slashing proof.
+type ProposerSlashing struct {
+	SignedHeader1 *SignedBeaconBlockHeader
+	SignedHeader2 *SignedBeaconBlockHeader
+}
+
 // Finality contains the current finality checkpoints.
 type Finality struct {
 	FinalizedEpoch phase0.Epoch
@@ -84,8 +112,11 @@ type Service interface {
 	GetFinality(ctx context.Context) (*Finality, error)
 	GetCommittees(ctx context.Context, slot phase0.Slot) ([]*Committee, error)
 	GetBlockAttestations(ctx context.Context, slot phase0.Slot) ([]*Attestation, error)
+	GetSignedBlockHeader(ctx context.Context, blockRoot phase0.Root) (*SignedBeaconBlockHeader, error)
 	SubmitAttesterSlashing(ctx context.Context, slashing *AttesterSlashing) error
+	SubmitProposerSlashing(ctx context.Context, slashing *ProposerSlashing) error
 	SubscribeToHeads(ctx context.Context, handler func(*HeadEvent)) error
+	SubscribeToBlocks(ctx context.Context, handler func(*BlockEvent)) error
 	ResolveAttestingValidators(ctx context.Context, att *Attestation) ([]phase0.ValidatorIndex, error)
 }
 
@@ -408,6 +439,79 @@ func (s *service) GetBlockAttestations(
 	return nil, ErrAllNodesFailed
 }
 
+// GetSignedBlockHeader retrieves a signed block header by block root.
+func (s *service) GetSignedBlockHeader(
+	ctx context.Context,
+	blockRoot phase0.Root,
+) (*SignedBeaconBlockHeader, error) {
+	path := fmt.Sprintf("/eth/v1/beacon/headers/0x%x", blockRoot)
+
+	var lastErr error
+
+	for _, n := range s.getHealthyNodes() {
+		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil)
+		if err != nil {
+			lastErr = err
+			s.markNodeUnhealthy(n)
+
+			continue
+		}
+
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, nil
+		}
+
+		var result struct {
+			Data struct {
+				Header struct {
+					Message struct {
+						Slot          string `json:"slot"`
+						ProposerIndex string `json:"proposer_index"`
+						ParentRoot    string `json:"parent_root"`
+						StateRoot     string `json:"state_root"`
+						BodyRoot      string `json:"body_root"`
+					} `json:"message"`
+					Signature string `json:"signature"`
+				} `json:"header"`
+			} `json:"data"`
+		}
+
+		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+			lastErr = fmt.Errorf("failed to decode header response: %w", err)
+
+			continue
+		}
+
+		slot, _ := parseUint64(result.Data.Header.Message.Slot)
+		proposerIndex, _ := parseUint64(result.Data.Header.Message.ProposerIndex)
+		parentRoot, _ := parseRoot(result.Data.Header.Message.ParentRoot)
+		stateRoot, _ := parseRoot(result.Data.Header.Message.StateRoot)
+		bodyRoot, _ := parseRoot(result.Data.Header.Message.BodyRoot)
+		sig, _ := parseSignature(result.Data.Header.Signature)
+
+		s.markNodeHealthy(n)
+
+		return &SignedBeaconBlockHeader{
+			Message: &BeaconBlockHeader{
+				Slot:          phase0.Slot(slot),
+				ProposerIndex: phase0.ValidatorIndex(proposerIndex),
+				ParentRoot:    parentRoot,
+				StateRoot:     stateRoot,
+				BodyRoot:      bodyRoot,
+			},
+			Signature: sig,
+		}, nil
+	}
+
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	return nil, ErrAllNodesFailed
+}
+
 // ResolveAttestingValidators resolves the attesting validators for an attestation.
 func (s *service) ResolveAttestingValidators(
 	ctx context.Context,
@@ -564,6 +668,95 @@ func (s *service) marshalSlashing(slashing *AttesterSlashing) ([]byte, error) {
 	return json.Marshal(apiSlashing)
 }
 
+// SubmitProposerSlashing submits a proposer slashing to all beacon nodes.
+func (s *service) SubmitProposerSlashing(ctx context.Context, slashing *ProposerSlashing) error {
+	body, err := s.marshalProposerSlashing(slashing)
+	if err != nil {
+		return fmt.Errorf("failed to marshal proposer slashing: %w", err)
+	}
+
+	var (
+		successCount int
+		lastErr      error
+	)
+
+	for _, n := range s.nodes {
+		resp, err := s.doNodeRequest(ctx, n, "POST", "/eth/v1/beacon/pool/proposer_slashings", body)
+		if err != nil {
+			lastErr = err
+
+			continue
+		}
+
+		resp.Body.Close()
+
+		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
+			successCount++
+
+			s.log.WithField("endpoint", n.endpoint).Debug("submitted proposer slashing to node")
+		} else {
+			s.log.WithFields(logrus.Fields{
+				"endpoint": n.endpoint,
+				"status":   resp.StatusCode,
+			}).Warn("failed to submit proposer slashing")
+		}
+	}
+
+	if successCount == 0 {
+		if lastErr != nil {
+			return lastErr
+		}
+
+		return ErrAllNodesFailed
+	}
+
+	s.log.WithField("nodes", successCount).Info("submitted proposer slashing to beacon nodes")
+
+	return nil
+}
+
+func (s *service) marshalProposerSlashing(slashing *ProposerSlashing) ([]byte, error) {
+	type apiHeader struct {
+		Message struct {
+			Slot          string `json:"slot"`
+			ProposerIndex string `json:"proposer_index"`
+			ParentRoot    string `json:"parent_root"`
+			StateRoot     string `json:"state_root"`
+			BodyRoot      string `json:"body_root"`
+		} `json:"message"`
+		Signature string `json:"signature"`
+	}
+
+	toAPI := func(h *SignedBeaconBlockHeader) apiHeader {
+		return apiHeader{
+			Message: struct {
+				Slot          string `json:"slot"`
+				ProposerIndex string `json:"proposer_index"`
+				ParentRoot    string `json:"parent_root"`
+				StateRoot     string `json:"state_root"`
+				BodyRoot      string `json:"body_root"`
+			}{
+				Slot:          fmt.Sprintf("%d", h.Message.Slot),
+				ProposerIndex: fmt.Sprintf("%d", h.Message.ProposerIndex),
+				ParentRoot:    fmt.Sprintf("0x%x", h.Message.ParentRoot),
+				StateRoot:     fmt.Sprintf("0x%x", h.Message.StateRoot),
+				BodyRoot:      fmt.Sprintf("0x%x", h.Message.BodyRoot),
+			},
+			Signature: fmt.Sprintf("0x%x", h.Signature),
+		}
+	}
+
+	apiSlashing := struct {
+		SignedHeader1 apiHeader `json:"signed_header_1"`
+		SignedHeader2 apiHeader `json:"signed_header_2"`
+	}{
+		SignedHeader1: toAPI(slashing.SignedHeader1),
+		SignedHeader2: toAPI(slashing.SignedHeader2),
+	}
+
+	return json.Marshal(apiSlashing)
+}
+
 // SubscribeToHeads subscribes to head events from all beacon nodes.
 func (s *service) SubscribeToHeads(
 	ctx context.Context,
@@ -640,6 +833,77 @@ func (s *service) parseHeadEvent(data []byte) (*HeadEvent, error) {
 	return &HeadEvent{
 		Slot:  phase0.Slot(slot),
 		Block: block,
+	}, nil
+}
+
+// SubscribeToBlocks subscribes to block events from all beacon nodes.
+// Block events are broadcast immediately when received, before potential reorgs.
+func (s *service) SubscribeToBlocks(
+	ctx context.Context,
+	handler func(*BlockEvent),
+) error {
+	for _, n := range s.nodes {
+		n := n
+
+		s.wg.Add(1)
+
+		go func() {
+			defer s.wg.Done()
+
+			s.subscribeNodeBlocks(ctx, n, handler)
+		}()
+	}
+
+	<-ctx.Done()
+
+	return ctx.Err()
+}
+
+func (s *service) subscribeNodeBlocks(
+	ctx context.Context,
+	n *node,
+	handler func(*BlockEvent),
+) {
+	log := s.log.WithField("endpoint", n.endpoint)
+
+	stream := NewStream(n.endpoint, log)
+
+	err := stream.Subscribe(ctx, "block", func(data []byte) {
+		event, err := s.parseBlockEvent(data)
+		if err != nil {
+			log.WithError(err).Debug("failed to parse block event")
+
+			return
+		}
+
+		handler(event)
+	})
+
+	if err != nil && ctx.Err() == nil {
+		log.WithError(err).Warn("block subscription ended")
+	}
+}
+
+func (s *service) parseBlockEvent(data []byte) (*BlockEvent, error) {
+	var event struct {
+		Slot                string `json:"slot"`
+		Block               string `json:"block"`
+		ProposerIndex       string `json:"proposer_index"`
+		ExecutionOptimistic bool   `json:"execution_optimistic"`
+	}
+
+	if err := json.Unmarshal(data, &event); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal block event: %w", err)
+	}
+
+	slot, _ := parseUint64(event.Slot)
+	block, _ := parseRoot(event.Block)
+	proposerIndex, _ := parseUint64(event.ProposerIndex)
+
+	return &BlockEvent{
+		Slot:          phase0.Slot(slot),
+		Block:         block,
+		ProposerIndex: phase0.ValidatorIndex(proposerIndex),
 	}, nil
 }
 

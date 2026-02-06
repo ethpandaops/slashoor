@@ -6,6 +6,7 @@ import (
 	"github.com/slashoor/slashoor/pkg/beacon"
 	"github.com/slashoor/slashoor/pkg/detector"
 	"github.com/slashoor/slashoor/pkg/indexer"
+	"github.com/slashoor/slashoor/pkg/proposer"
 	"github.com/slashoor/slashoor/pkg/submitter"
 )
 
@@ -14,6 +15,7 @@ type Config struct {
 	Beacon    *beacon.Config    `yaml:"beacon"`
 	Indexer   *indexer.Config   `yaml:"indexer"`
 	Detector  *detector.Config  `yaml:"detector"`
+	Proposer  *proposer.Config  `yaml:"proposer"`
 	Submitter *submitter.Config `yaml:"submitter"`
 
 	// StartSlot, if set via --start-slot flag, rescans from this slot to head on startup.
@@ -35,6 +37,7 @@ func DefaultConfig() *Config {
 		Beacon:        beacon.DefaultConfig(),
 		Indexer:       indexer.DefaultConfig(),
 		Detector:      detector.DefaultConfig(),
+		Proposer:      proposer.DefaultConfig(),
 		Submitter:     submitter.DefaultConfig(),
 		BackfillSlots: 64,
 	}
@@ -64,6 +67,14 @@ func (c *Config) Validate() error {
 
 	if err := c.Detector.Validate(); err != nil {
 		return fmt.Errorf("detector config: %w", err)
+	}
+
+	if c.Proposer == nil {
+		c.Proposer = proposer.DefaultConfig()
+	}
+
+	if err := c.Proposer.Validate(); err != nil {
+		return fmt.Errorf("proposer config: %w", err)
 	}
 
 	if c.Submitter == nil {

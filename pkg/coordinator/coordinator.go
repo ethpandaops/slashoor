@@ -11,6 +11,7 @@ import (
 	"github.com/slashoor/slashoor/pkg/beacon"
 	"github.com/slashoor/slashoor/pkg/detector"
 	"github.com/slashoor/slashoor/pkg/indexer"
+	"github.com/slashoor/slashoor/pkg/proposer"
 	"github.com/slashoor/slashoor/pkg/submitter"
 )
 
@@ -27,6 +28,7 @@ type service struct {
 	beacon    beacon.Service
 	indexer   indexer.Service
 	detector  detector.Service
+	proposer  proposer.Service
 	submitter submitter.Service
 
 	wg     sync.WaitGroup
@@ -45,6 +47,7 @@ func New(cfg *Config, log logrus.FieldLogger) (Service, error) {
 	beaconSvc := beacon.New(cfg.Beacon, log)
 	indexerSvc := indexer.New(cfg.Indexer, log)
 	detectorSvc := detector.New(cfg.Detector, beaconSvc, log)
+	proposerSvc := proposer.New(cfg.Proposer, beaconSvc, log)
 	submitterSvc := submitter.New(cfg.Submitter, beaconSvc, log)
 
 	return &service{
@@ -53,6 +56,7 @@ func New(cfg *Config, log logrus.FieldLogger) (Service, error) {
 		beacon:    beaconSvc,
 		indexer:   indexerSvc,
 		detector:  detectorSvc,
+		proposer:  proposerSvc,
 		submitter: submitterSvc,
 	}, nil
 }
@@ -73,6 +77,10 @@ func (s *service) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start detector service: %w", err)
 	}
 
+	if err := s.proposer.Start(s.ctx); err != nil {
+		return fmt.Errorf("failed to start proposer service: %w", err)
+	}
+
 	if err := s.submitter.Start(s.ctx); err != nil {
 		return fmt.Errorf("failed to start submitter service: %w", err)
 	}
@@ -85,6 +93,10 @@ func (s *service) Start(ctx context.Context) error {
 
 	if err := s.subscribeToHeads(); err != nil {
 		return fmt.Errorf("failed to subscribe to heads: %w", err)
+	}
+
+	if err := s.subscribeToBlocks(); err != nil {
+		return fmt.Errorf("failed to subscribe to blocks: %w", err)
 	}
 
 	s.log.Info("coordinator started")
@@ -112,6 +124,10 @@ func (s *service) Stop() error {
 		errs = append(errs, fmt.Errorf("detector: %w", err))
 	}
 
+	if err := s.proposer.Stop(); err != nil {
+		errs = append(errs, fmt.Errorf("proposer: %w", err))
+	}
+
 	if err := s.indexer.Stop(); err != nil {
 		errs = append(errs, fmt.Errorf("indexer: %w", err))
 	}
@@ -135,7 +151,11 @@ func (s *service) wireServices() {
 	})
 
 	s.detector.OnSlashing(func(slashing *beacon.AttesterSlashing) {
-		s.submitter.Submit(slashing)
+		s.submitter.SubmitAttesterSlashing(slashing)
+	})
+
+	s.proposer.OnSlashing(func(slashing *beacon.ProposerSlashing) {
+		s.submitter.SubmitProposerSlashing(slashing)
 	})
 }
 
@@ -153,6 +173,47 @@ func (s *service) subscribeToHeads() error {
 	}()
 
 	return nil
+}
+
+func (s *service) subscribeToBlocks() error {
+	s.wg.Add(1)
+
+	go func() {
+		defer s.wg.Done()
+
+		if err := s.beacon.SubscribeToBlocks(s.ctx, s.handleBlock); err != nil {
+			if s.ctx.Err() == nil {
+				s.log.WithError(err).Error("block subscription failed")
+			}
+		}
+	}()
+
+	return nil
+}
+
+func (s *service) handleBlock(event *beacon.BlockEvent) {
+	// SSE block events don't include proposer_index, fetch it from header
+	if event.ProposerIndex == 0 {
+		header, err := s.beacon.GetSignedBlockHeader(s.ctx, event.Block)
+		if err != nil {
+			s.log.WithError(err).WithField("block", fmt.Sprintf("0x%x", event.Block[:8])).
+				Debug("failed to get block header")
+
+			return
+		}
+
+		if header != nil {
+			event.ProposerIndex = header.Message.ProposerIndex
+		}
+	}
+
+	s.log.WithFields(logrus.Fields{
+		"slot":     event.Slot,
+		"proposer": event.ProposerIndex,
+		"block":    fmt.Sprintf("0x%x", event.Block[:8]),
+	}).Debug("new block received")
+
+	s.proposer.HandleBlock(s.ctx, event)
 }
 
 func (s *service) handleHead(event *beacon.HeadEvent) {

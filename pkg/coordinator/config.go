@@ -1,0 +1,65 @@
+package coordinator
+
+import (
+	"fmt"
+
+	"github.com/slashoor/slashoor/pkg/beacon"
+	"github.com/slashoor/slashoor/pkg/detector"
+	"github.com/slashoor/slashoor/pkg/indexer"
+	"github.com/slashoor/slashoor/pkg/submitter"
+)
+
+// Config holds the top-level configuration for the slashoor.
+type Config struct {
+	Beacon    *beacon.Config    `yaml:"beacon"`
+	Indexer   *indexer.Config   `yaml:"indexer"`
+	Detector  *detector.Config  `yaml:"detector"`
+	Submitter *submitter.Config `yaml:"submitter"`
+}
+
+// DefaultConfig returns a Config with sensible defaults.
+func DefaultConfig() *Config {
+	return &Config{
+		Beacon:    beacon.DefaultConfig(),
+		Indexer:   indexer.DefaultConfig(),
+		Detector:  detector.DefaultConfig(),
+		Submitter: submitter.DefaultConfig(),
+	}
+}
+
+// Validate checks the configuration for errors.
+func (c *Config) Validate() error {
+	if c.Beacon == nil {
+		c.Beacon = beacon.DefaultConfig()
+	}
+
+	if err := c.Beacon.Validate(); err != nil {
+		return fmt.Errorf("beacon config: %w", err)
+	}
+
+	if c.Indexer == nil {
+		c.Indexer = indexer.DefaultConfig()
+	}
+
+	if err := c.Indexer.Validate(); err != nil {
+		return fmt.Errorf("indexer config: %w", err)
+	}
+
+	if c.Detector == nil {
+		c.Detector = detector.DefaultConfig()
+	}
+
+	if err := c.Detector.Validate(); err != nil {
+		return fmt.Errorf("detector config: %w", err)
+	}
+
+	if c.Submitter == nil {
+		c.Submitter = submitter.DefaultConfig()
+	}
+
+	if err := c.Submitter.Validate(); err != nil {
+		return fmt.Errorf("submitter config: %w", err)
+	}
+
+	return nil
+}

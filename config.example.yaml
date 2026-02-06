@@ -1,0 +1,16 @@
+beacon:
+  endpoints:
+    - "http://localhost:5052"
+    - "http://localhost:5053"
+    - "http://beacon-node-1:5052"
+  timeout: 30s
+
+indexer:
+  max_epochs_to_keep: 54000
+
+detector:
+  enabled: true
+
+submitter:
+  enabled: true
+  dry_run: false

@@ -1,0 +1,32 @@
+# Binaries
+slashoor
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Config files with secrets
+config.yaml
+config.yml
+!config.example.yaml
+
+# OS files
+.DS_Store
+Thumbs.db

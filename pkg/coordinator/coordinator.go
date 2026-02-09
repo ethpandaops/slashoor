@@ -10,6 +10,7 @@ import (
 
 	"github.com/slashoor/slashoor/pkg/beacon"
 	"github.com/slashoor/slashoor/pkg/detector"
+	"github.com/slashoor/slashoor/pkg/dora"
 	"github.com/slashoor/slashoor/pkg/indexer"
 	"github.com/slashoor/slashoor/pkg/proposer"
 	"github.com/slashoor/slashoor/pkg/submitter"
@@ -30,6 +31,7 @@ type service struct {
 	detector  detector.Service
 	proposer  proposer.Service
 	submitter submitter.Service
+	dora      dora.Service
 
 	wg     sync.WaitGroup
 	ctx    context.Context
@@ -49,6 +51,7 @@ func New(cfg *Config, log logrus.FieldLogger) (Service, error) {
 	detectorSvc := detector.New(cfg.Detector, beaconSvc, log)
 	proposerSvc := proposer.New(cfg.Proposer, beaconSvc, log)
 	submitterSvc := submitter.New(cfg.Submitter, beaconSvc, log)
+	doraSvc := dora.New(cfg.Dora, log)
 
 	return &service{
 		cfg:       cfg,
@@ -58,6 +61,7 @@ func New(cfg *Config, log logrus.FieldLogger) (Service, error) {
 		detector:  detectorSvc,
 		proposer:  proposerSvc,
 		submitter: submitterSvc,
+		dora:      doraSvc,
 	}, nil
 }
 
@@ -85,10 +89,18 @@ func (s *service) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start submitter service: %w", err)
 	}
 
+	if err := s.dora.Start(s.ctx); err != nil {
+		return fmt.Errorf("failed to start dora service: %w", err)
+	}
+
 	s.wireServices()
 
 	if err := s.backfillAttestations(); err != nil {
 		s.log.WithError(err).Warn("failed to backfill attestations")
+	}
+
+	if err := s.scanDoraHistorical(); err != nil {
+		s.log.WithError(err).Warn("failed to scan dora for historical proposer slashings")
 	}
 
 	if err := s.subscribeToHeads(); err != nil {
@@ -134,6 +146,10 @@ func (s *service) Stop() error {
 
 	if err := s.beacon.Stop(); err != nil {
 		errs = append(errs, fmt.Errorf("beacon: %w", err))
+	}
+
+	if err := s.dora.Stop(); err != nil {
+		errs = append(errs, fmt.Errorf("dora: %w", err))
 	}
 
 	if len(errs) > 0 {
@@ -307,4 +323,182 @@ func (s *service) backfillAttestations() error {
 	}).Info("backfill complete")
 
 	return nil
+}
+
+func (s *service) scanDoraHistorical() error {
+	if !s.cfg.Dora.Enabled || !s.cfg.Dora.ScanOnStartup {
+		return nil
+	}
+
+	finality, err := s.beacon.GetFinality(s.ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get finality: %w", err)
+	}
+
+	// Dora scan always starts from slot 0 to find all historical proposer slashings
+	// This is independent of the backfill range since Dora has all historical data
+	var startSlot uint64 = 0
+
+	endSlot := uint64(finality.HeadSlot)
+
+	s.log.WithFields(logrus.Fields{
+		"start_slot": startSlot,
+		"end_slot":   endSlot,
+	}).Info("scanning dora for historical proposer slashings")
+
+	// Get slots with multiple blocks (potential double proposals)
+	slotsWithMultipleBlocks, err := s.dora.GetSlotsWithMultipleBlocks(s.ctx, startSlot, endSlot)
+	if err != nil {
+		return fmt.Errorf("failed to get slots with multiple blocks: %w", err)
+	}
+
+	if len(slotsWithMultipleBlocks) == 0 {
+		s.log.Info("no slots with multiple blocks found in dora")
+
+		return nil
+	}
+
+	s.log.WithField("slots_count", len(slotsWithMultipleBlocks)).
+		Info("found slots with multiple blocks")
+
+	var slashingsCreated uint64
+
+	for slot, blocks := range slotsWithMultipleBlocks {
+		if s.ctx.Err() != nil {
+			return s.ctx.Err()
+		}
+
+		// Group blocks by proposer
+		blocksByProposer := make(map[phase0.ValidatorIndex][]*dora.OrphanedBlock, 4)
+		for _, block := range blocks {
+			blocksByProposer[block.ProposerIndex] = append(blocksByProposer[block.ProposerIndex], block)
+		}
+
+		// Check each proposer for double proposals
+		for proposerIndex, proposerBlocks := range blocksByProposer {
+			if len(proposerBlocks) < 2 {
+				continue
+			}
+
+			s.log.WithFields(logrus.Fields{
+				"slot":           slot,
+				"proposer_index": proposerIndex,
+				"block_count":    len(proposerBlocks),
+			}).Warn("potential proposer double-proposal detected via dora")
+
+			// Try to create slashing proof from the first two blocks
+			block1 := proposerBlocks[0]
+			block2 := proposerBlocks[1]
+
+			slashing, err := s.createProposerSlashingFromDora(block1, block2)
+			if err != nil {
+				s.log.WithError(err).WithFields(logrus.Fields{
+					"slot":           slot,
+					"proposer_index": proposerIndex,
+				}).Warn("failed to create proposer slashing from dora data")
+
+				continue
+			}
+
+			if slashing != nil {
+				slashingsCreated++
+
+				s.submitter.SubmitProposerSlashing(slashing)
+			}
+		}
+	}
+
+	s.log.WithField("slashings_created", slashingsCreated).
+		Info("dora historical scan complete")
+
+	return nil
+}
+
+func (s *service) createProposerSlashingFromDora(
+	block1, block2 *dora.OrphanedBlock,
+) (*beacon.ProposerSlashing, error) {
+	// Try to fetch signed headers from beacon node first, fall back to Dora
+	header1, err := s.getSignedHeaderWithFallback(block1.BlockRoot, block1.Slot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get header for block1 0x%x: %w", block1.BlockRoot[:8], err)
+	}
+
+	if header1 == nil {
+		s.log.WithFields(logrus.Fields{
+			"slot":       block1.Slot,
+			"block_root": fmt.Sprintf("0x%x", block1.BlockRoot[:8]),
+		}).Debug("block1 header not available from beacon or dora")
+
+		return nil, nil
+	}
+
+	header2, err := s.getSignedHeaderWithFallback(block2.BlockRoot, block2.Slot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get header for block2 0x%x: %w", block2.BlockRoot[:8], err)
+	}
+
+	if header2 == nil {
+		s.log.WithFields(logrus.Fields{
+			"slot":       block2.Slot,
+			"block_root": fmt.Sprintf("0x%x", block2.BlockRoot[:8]),
+		}).Debug("block2 header not available from beacon or dora")
+
+		return nil, nil
+	}
+
+	// Verify headers are from the same proposer
+	if header1.Message.ProposerIndex != header2.Message.ProposerIndex {
+		s.log.Warn("proposer mismatch in headers - not a valid slashing")
+
+		return nil, nil
+	}
+
+	s.log.WithFields(logrus.Fields{
+		"slot":           block1.Slot,
+		"proposer_index": header1.Message.ProposerIndex,
+		"block1":         fmt.Sprintf("0x%x", block1.BlockRoot[:8]),
+		"block2":         fmt.Sprintf("0x%x", block2.BlockRoot[:8]),
+	}).Info("created proposer slashing proof from dora data")
+
+	return &beacon.ProposerSlashing{
+		SignedHeader1: header1,
+		SignedHeader2: header2,
+	}, nil
+}
+
+// getSignedHeaderWithFallback tries beacon node first, then falls back to Dora web scraping.
+func (s *service) getSignedHeaderWithFallback(
+	blockRoot phase0.Root,
+	slot phase0.Slot,
+) (*beacon.SignedBeaconBlockHeader, error) {
+	// Try beacon node first
+	header, err := s.beacon.GetSignedBlockHeader(s.ctx, blockRoot)
+	if err == nil && header != nil {
+		s.log.WithFields(logrus.Fields{
+			"slot":       slot,
+			"block_root": fmt.Sprintf("0x%x", blockRoot[:8]),
+		}).Debug("got header from beacon node")
+
+		return header, nil
+	}
+
+	// Fall back to Dora web scraping
+	s.log.WithFields(logrus.Fields{
+		"slot":       slot,
+		"block_root": fmt.Sprintf("0x%x", blockRoot[:8]),
+	}).Debug("beacon node doesn't have header, trying dora")
+
+	header, err = s.dora.GetSignedBlockHeader(s.ctx, blockRoot)
+	if err != nil {
+		return nil, fmt.Errorf("dora fallback failed: %w", err)
+	}
+
+	if header != nil {
+		s.log.WithFields(logrus.Fields{
+			"slot":       slot,
+			"block_root": fmt.Sprintf("0x%x", blockRoot[:8]),
+		}).Debug("got header from dora web interface")
+	}
+
+	return header, nil
 }

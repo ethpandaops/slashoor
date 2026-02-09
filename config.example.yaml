@@ -14,3 +14,13 @@ detector:
 submitter:
   enabled: true
   dry_run: false
+
+proposer:
+  enabled: true
+
+dora:
+  enabled: false
+  url: "https://dora.example.com"
+  scan_on_startup: true
+
+# backfill_slots: 64

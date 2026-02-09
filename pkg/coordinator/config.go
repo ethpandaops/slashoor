@@ -5,6 +5,7 @@ import (
 
 	"github.com/slashoor/slashoor/pkg/beacon"
 	"github.com/slashoor/slashoor/pkg/detector"
+	"github.com/slashoor/slashoor/pkg/dora"
 	"github.com/slashoor/slashoor/pkg/indexer"
 	"github.com/slashoor/slashoor/pkg/proposer"
 	"github.com/slashoor/slashoor/pkg/submitter"
@@ -17,6 +18,7 @@ type Config struct {
 	Detector  *detector.Config  `yaml:"detector"`
 	Proposer  *proposer.Config  `yaml:"proposer"`
 	Submitter *submitter.Config `yaml:"submitter"`
+	Dora      *dora.Config      `yaml:"dora"`
 
 	// StartSlot, if set via --start-slot flag, rescans from this slot to head on startup.
 	// Useful for rescanning historical attestations.
@@ -39,6 +41,7 @@ func DefaultConfig() *Config {
 		Detector:      detector.DefaultConfig(),
 		Proposer:      proposer.DefaultConfig(),
 		Submitter:     submitter.DefaultConfig(),
+		Dora:          dora.DefaultConfig(),
 		BackfillSlots: 64,
 	}
 }
@@ -83,6 +86,14 @@ func (c *Config) Validate() error {
 
 	if err := c.Submitter.Validate(); err != nil {
 		return fmt.Errorf("submitter config: %w", err)
+	}
+
+	if c.Dora == nil {
+		c.Dora = dora.DefaultConfig()
+	}
+
+	if err := c.Dora.Validate(); err != nil {
+		return fmt.Errorf("dora config: %w", err)
 	}
 
 	if c.BackfillSlots == 0 {

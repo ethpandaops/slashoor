@@ -330,81 +330,52 @@ func (s *service) scanDoraHistorical() error {
 		return nil
 	}
 
-	finality, err := s.beacon.GetFinality(s.ctx)
+	s.log.Info("scanning dora for all historical double-proposals")
+
+	// Get all double-proposals by checking each orphaned block against its canonical counterpart
+	doubleProposals, err := s.dora.GetAllDoubleProposals(s.ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get finality: %w", err)
+		return fmt.Errorf("failed to get double proposals: %w", err)
 	}
 
-	// Dora scan always starts from slot 0 to find all historical proposer slashings
-	// This is independent of the backfill range since Dora has all historical data
-	var startSlot uint64 = 0
-
-	endSlot := uint64(finality.HeadSlot)
-
-	s.log.WithFields(logrus.Fields{
-		"start_slot": startSlot,
-		"end_slot":   endSlot,
-	}).Info("scanning dora for historical proposer slashings")
-
-	// Get slots with multiple blocks (potential double proposals)
-	slotsWithMultipleBlocks, err := s.dora.GetSlotsWithMultipleBlocks(s.ctx, startSlot, endSlot)
-	if err != nil {
-		return fmt.Errorf("failed to get slots with multiple blocks: %w", err)
-	}
-
-	if len(slotsWithMultipleBlocks) == 0 {
-		s.log.Info("no slots with multiple blocks found in dora")
+	if len(doubleProposals) == 0 {
+		s.log.Info("no double-proposals found in dora")
 
 		return nil
 	}
 
-	s.log.WithField("slots_count", len(slotsWithMultipleBlocks)).
-		Info("found slots with multiple blocks")
+	s.log.WithField("double_proposals", len(doubleProposals)).
+		Info("found double-proposals to process")
 
 	var slashingsCreated uint64
 
-	for slot, blocks := range slotsWithMultipleBlocks {
+	for _, dp := range doubleProposals {
 		if s.ctx.Err() != nil {
 			return s.ctx.Err()
 		}
 
-		// Group blocks by proposer
-		blocksByProposer := make(map[phase0.ValidatorIndex][]*dora.OrphanedBlock, 4)
-		for _, block := range blocks {
-			blocksByProposer[block.ProposerIndex] = append(blocksByProposer[block.ProposerIndex], block)
+		s.log.WithFields(logrus.Fields{
+			"slot":           dp.Slot,
+			"proposer_index": dp.ProposerIndex,
+			"canonical_root": fmt.Sprintf("0x%x", dp.CanonicalRoot[:8]),
+			"orphaned_root":  fmt.Sprintf("0x%x", dp.OrphanedRoot[:8]),
+		}).Info("processing double-proposal")
+
+		// Create slashing proof
+		slashing, err := s.createProposerSlashingFromDoubleProposal(dp)
+		if err != nil {
+			s.log.WithError(err).WithFields(logrus.Fields{
+				"slot":           dp.Slot,
+				"proposer_index": dp.ProposerIndex,
+			}).Warn("failed to create proposer slashing from double-proposal")
+
+			continue
 		}
 
-		// Check each proposer for double proposals
-		for proposerIndex, proposerBlocks := range blocksByProposer {
-			if len(proposerBlocks) < 2 {
-				continue
-			}
+		if slashing != nil {
+			slashingsCreated++
 
-			s.log.WithFields(logrus.Fields{
-				"slot":           slot,
-				"proposer_index": proposerIndex,
-				"block_count":    len(proposerBlocks),
-			}).Warn("potential proposer double-proposal detected via dora")
-
-			// Try to create slashing proof from the first two blocks
-			block1 := proposerBlocks[0]
-			block2 := proposerBlocks[1]
-
-			slashing, err := s.createProposerSlashingFromDora(block1, block2)
-			if err != nil {
-				s.log.WithError(err).WithFields(logrus.Fields{
-					"slot":           slot,
-					"proposer_index": proposerIndex,
-				}).Warn("failed to create proposer slashing from dora data")
-
-				continue
-			}
-
-			if slashing != nil {
-				slashingsCreated++
-
-				s.submitter.SubmitProposerSlashing(slashing)
-			}
+			s.submitter.SubmitProposerSlashing(slashing)
 		}
 	}
 
@@ -412,6 +383,62 @@ func (s *service) scanDoraHistorical() error {
 		Info("dora historical scan complete")
 
 	return nil
+}
+
+func (s *service) createProposerSlashingFromDoubleProposal(
+	dp *dora.DoubleProposal,
+) (*beacon.ProposerSlashing, error) {
+	// Fetch signed headers for both blocks (canonical and orphaned)
+	header1, err := s.getSignedHeaderWithFallback(dp.CanonicalRoot, dp.Slot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get canonical header 0x%x: %w", dp.CanonicalRoot[:8], err)
+	}
+
+	if header1 == nil {
+		s.log.WithFields(logrus.Fields{
+			"slot":       dp.Slot,
+			"block_root": fmt.Sprintf("0x%x", dp.CanonicalRoot[:8]),
+		}).Debug("canonical header not available")
+
+		return nil, nil
+	}
+
+	header2, err := s.getSignedHeaderWithFallback(dp.OrphanedRoot, dp.Slot)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get orphaned header 0x%x: %w", dp.OrphanedRoot[:8], err)
+	}
+
+	if header2 == nil {
+		s.log.WithFields(logrus.Fields{
+			"slot":       dp.Slot,
+			"block_root": fmt.Sprintf("0x%x", dp.OrphanedRoot[:8]),
+		}).Debug("orphaned header not available")
+
+		return nil, nil
+	}
+
+	// Verify headers are from the same proposer
+	if header1.Message.ProposerIndex != header2.Message.ProposerIndex {
+		s.log.WithFields(logrus.Fields{
+			"slot":             dp.Slot,
+			"header1_proposer": header1.Message.ProposerIndex,
+			"header2_proposer": header2.Message.ProposerIndex,
+		}).Warn("proposer mismatch in headers - not a valid slashing")
+
+		return nil, nil
+	}
+
+	s.log.WithFields(logrus.Fields{
+		"slot":           dp.Slot,
+		"proposer_index": header1.Message.ProposerIndex,
+		"canonical":      fmt.Sprintf("0x%x", dp.CanonicalRoot[:8]),
+		"orphaned":       fmt.Sprintf("0x%x", dp.OrphanedRoot[:8]),
+	}).Info("created proposer slashing proof")
+
+	return &beacon.ProposerSlashing{
+		SignedHeader1: header1,
+		SignedHeader2: header2,
+	}, nil
 }
 
 func (s *service) createProposerSlashingFromDora(

@@ -24,6 +24,14 @@ type OrphanedBlock struct {
 	BlockRoot     phase0.Root
 }
 
+// DoubleProposal represents a detected double-proposal (slashable offense).
+type DoubleProposal struct {
+	Slot          phase0.Slot
+	ProposerIndex phase0.ValidatorIndex
+	CanonicalRoot phase0.Root
+	OrphanedRoot  phase0.Root
+}
+
 // Service defines the interface for the Dora client.
 type Service interface {
 	Start(ctx context.Context) error
@@ -31,6 +39,7 @@ type Service interface {
 	GetOrphanedBlocks(ctx context.Context, startSlot, endSlot uint64) ([]*OrphanedBlock, error)
 	GetSlotsWithMultipleBlocks(ctx context.Context, startSlot, endSlot uint64) (map[phase0.Slot][]*OrphanedBlock, error)
 	GetSignedBlockHeader(ctx context.Context, blockRoot phase0.Root) (*beacon.SignedBeaconBlockHeader, error)
+	GetAllDoubleProposals(ctx context.Context) ([]*DoubleProposal, error)
 }
 
 type service struct {
@@ -548,4 +557,140 @@ func parseSignature(s string) (phase0.BLSSignature, error) {
 	copy(sig[:], bytes)
 
 	return sig, nil
+}
+
+// GetAllDoubleProposals fetches all orphaned blocks and checks each against canonical
+// blocks to find double-proposals (same proposer for both canonical and orphaned block).
+func (s *service) GetAllDoubleProposals(ctx context.Context) ([]*DoubleProposal, error) {
+	if !s.cfg.Enabled {
+		return nil, nil
+	}
+
+	s.log.Info("fetching all orphaned blocks from dora")
+
+	var allOrphaned []*slotEntry
+
+	// Paginate through all orphaned blocks
+	nextSlot := int64(-1)
+
+	for {
+		var url string
+		if nextSlot < 0 {
+			url = fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100",
+				strings.TrimSuffix(s.cfg.URL, "/"))
+		} else {
+			url = fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100&start_slot=%d",
+				strings.TrimSuffix(s.cfg.URL, "/"), nextSlot)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		resp, err := s.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch orphaned blocks: %w", err)
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+
+			return nil, fmt.Errorf("dora API returned status %d", resp.StatusCode)
+		}
+
+		var slotsResp slotsResponse
+		if err := json.NewDecoder(resp.Body).Decode(&slotsResp); err != nil {
+			resp.Body.Close()
+
+			return nil, fmt.Errorf("failed to decode response: %w", err)
+		}
+
+		resp.Body.Close()
+
+		if slotsResp.Data == nil || len(slotsResp.Data.Slots) == 0 {
+			break
+		}
+
+		allOrphaned = append(allOrphaned, slotsResp.Data.Slots...)
+
+		s.log.WithFields(logrus.Fields{
+			"fetched":   len(slotsResp.Data.Slots),
+			"total":     len(allOrphaned),
+			"next_slot": slotsResp.Data.NextSlot,
+		}).Debug("fetched orphaned blocks batch")
+
+		if slotsResp.Data.NextSlot == 0 {
+			break
+		}
+
+		nextSlot = int64(slotsResp.Data.NextSlot)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	s.log.WithField("total_orphaned", len(allOrphaned)).Info("fetched all orphaned blocks")
+
+	// Check each orphaned block against its canonical counterpart
+	var doubleProposals []*DoubleProposal
+
+	for _, orphaned := range allOrphaned {
+		if ctx.Err() != nil {
+			return doubleProposals, ctx.Err()
+		}
+
+		// Get canonical block for this slot
+		canonical, err := s.getCanonicalBlock(ctx, orphaned.Slot)
+		if err != nil {
+			s.log.WithError(err).WithField("slot", orphaned.Slot).Debug("failed to get canonical block")
+
+			continue
+		}
+
+		if canonical == nil {
+			continue
+		}
+
+		// Same proposer + different block root = double proposal
+		if canonical.ProposerIndex == phase0.ValidatorIndex(orphaned.Proposer) {
+			orphanedRoot, err := parseRoot(orphaned.BlockRoot)
+			if err != nil {
+				continue
+			}
+
+			// Skip if same block root (not a double proposal)
+			if canonical.BlockRoot == orphanedRoot {
+				continue
+			}
+
+			s.log.WithFields(logrus.Fields{
+				"slot":           orphaned.Slot,
+				"proposer_index": orphaned.Proposer,
+				"canonical_root": fmt.Sprintf("0x%x", canonical.BlockRoot[:8]),
+				"orphaned_root":  fmt.Sprintf("0x%x", orphanedRoot[:8]),
+			}).Warn("double-proposal detected")
+
+			doubleProposals = append(doubleProposals, &DoubleProposal{
+				Slot:          phase0.Slot(orphaned.Slot),
+				ProposerIndex: phase0.ValidatorIndex(orphaned.Proposer),
+				CanonicalRoot: canonical.BlockRoot,
+				OrphanedRoot:  orphanedRoot,
+			})
+		}
+
+		// Rate limit API calls
+		select {
+		case <-ctx.Done():
+			return doubleProposals, ctx.Err()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	s.log.WithField("double_proposals", len(doubleProposals)).Info("double-proposal scan complete")
+
+	return doubleProposals, nil
 }

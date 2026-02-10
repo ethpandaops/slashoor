@@ -141,7 +141,6 @@ type service struct {
 	committeeMu    sync.RWMutex
 	committeeCache map[committeeKey][]phase0.ValidatorIndex
 
-	mu     sync.RWMutex
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }

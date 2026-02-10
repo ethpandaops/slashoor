@@ -1,11 +1,17 @@
-name: Release
+name: Build Release
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version Number (e.g., '0.1.0')"
+        required: true
 
 env:
   DOCKERHUB_REPO: ethpandaops/slashoor
+
+permissions:
+  contents: write
 
 jobs:
   check:
@@ -25,10 +31,25 @@ jobs:
       - name: Run go vet
         run: go vet ./...
 
+      - name: Check go fmt
+        run: |
+          if [ "$(gofmt -s -l . | wc -l)" -gt 0 ]; then
+            echo "Code is not formatted. Run 'go fmt ./...'"
+            gofmt -s -l .
+            exit 1
+          fi
+
+      - name: Install staticcheck
+        run: go install honnef.co/go/tools/cmd/staticcheck@latest
+
+      - name: Run staticcheck
+        run: staticcheck ./...
+
       - name: Run tests
         run: go test -race -vet=off ./...
 
   build-and-push:
+    name: Build and push Docker image
     needs: [check]
     runs-on: ubuntu-latest
 
@@ -48,28 +69,61 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Extract metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ${{ env.DOCKERHUB_REPO }}
-          tags: |
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
-            type=semver,pattern={{major}}
-            type=raw,value=latest
-
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64,linux/arm64
           push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
+          tags: |
+            ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}
+            ${{ env.DOCKERHUB_REPO }}:latest
           build-args: |
-            VERSION=${{ github.ref_name }}
+            VERSION=v${{ inputs.version }}
             GIT_COMMIT=${{ github.sha }}
-            BUILD_TIME=${{ github.event.release.created_at }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  create-release:
+    name: Create GitHub Release
+    needs: [build-and-push]
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          git fetch --tags
+          prev_tag=$(git tag --sort=-version:refname | grep -e "^v[0-9.]*$" | head -n 1)
+          echo "previous release: $prev_tag"
+          if [ "$prev_tag" ]; then
+            changelog=$(git log --oneline --no-decorate $prev_tag..HEAD)
+          else
+            changelog=$(git log --oneline --no-decorate)
+          fi
+          echo "changelog<<EOF" >> $GITHUB_OUTPUT
+          echo "$changelog" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ inputs.version }}
+          release_name: v${{ inputs.version }}
+          draft: false
+          prerelease: false
+          body: |
+            ## What's Changed
+            ${{ steps.changelog.outputs.changelog }}
+
+            ## Docker Image
+            ```
+            docker pull ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}
+            ```

@@ -464,58 +464,6 @@ func (s *service) createProposerSlashingFromDoubleProposal(
 	}, nil
 }
 
-func (s *service) createProposerSlashingFromDora(
-	block1, block2 *dora.OrphanedBlock,
-) (*beacon.ProposerSlashing, error) {
-	// Try to fetch signed headers from beacon node first, fall back to Dora
-	header1, err := s.getSignedHeaderWithFallback(block1.BlockRoot, block1.Slot)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get header for block1 0x%x: %w", block1.BlockRoot[:8], err)
-	}
-
-	if header1 == nil {
-		s.log.WithFields(logrus.Fields{
-			"slot":       block1.Slot,
-			"block_root": fmt.Sprintf("0x%x", block1.BlockRoot[:8]),
-		}).Debug("block1 header not available from beacon or dora")
-
-		return nil, nil
-	}
-
-	header2, err := s.getSignedHeaderWithFallback(block2.BlockRoot, block2.Slot)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get header for block2 0x%x: %w", block2.BlockRoot[:8], err)
-	}
-
-	if header2 == nil {
-		s.log.WithFields(logrus.Fields{
-			"slot":       block2.Slot,
-			"block_root": fmt.Sprintf("0x%x", block2.BlockRoot[:8]),
-		}).Debug("block2 header not available from beacon or dora")
-
-		return nil, nil
-	}
-
-	// Verify headers are from the same proposer
-	if header1.Message.ProposerIndex != header2.Message.ProposerIndex {
-		s.log.Warn("proposer mismatch in headers - not a valid slashing")
-
-		return nil, nil
-	}
-
-	s.log.WithFields(logrus.Fields{
-		"slot":           block1.Slot,
-		"proposer_index": header1.Message.ProposerIndex,
-		"block1":         fmt.Sprintf("0x%x", block1.BlockRoot[:8]),
-		"block2":         fmt.Sprintf("0x%x", block2.BlockRoot[:8]),
-	}).Info("created proposer slashing proof from dora data")
-
-	return &beacon.ProposerSlashing{
-		SignedHeader1: header1,
-		SignedHeader2: header2,
-	}, nil
-}
-
 // getSignedHeaderWithFallback tries beacon node first, then falls back to Dora web scraping.
 func (s *service) getSignedHeaderWithFallback(
 	blockRoot phase0.Root,

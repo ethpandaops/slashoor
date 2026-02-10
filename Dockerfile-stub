@@ -1,0 +1,12 @@
+FROM alpine:3.20
+
+RUN apk add --no-cache ca-certificates tzdata
+
+RUN adduser -D -g '' slashoor
+USER slashoor
+
+WORKDIR /app
+
+COPY bin/slashoor .
+
+ENTRYPOINT ["/app/slashoor"]

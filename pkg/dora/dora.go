@@ -40,6 +40,7 @@ type Service interface {
 	GetSlotsWithMultipleBlocks(ctx context.Context, startSlot, endSlot uint64) (map[phase0.Slot][]*OrphanedBlock, error)
 	GetSignedBlockHeader(ctx context.Context, blockRoot phase0.Root) (*beacon.SignedBeaconBlockHeader, error)
 	GetAllDoubleProposals(ctx context.Context) ([]*DoubleProposal, error)
+	IsValidatorSlashed(ctx context.Context, validatorIndex phase0.ValidatorIndex) (bool, error)
 }
 
 type service struct {
@@ -89,7 +90,8 @@ type slotsResponse struct {
 type slotsData struct {
 	Slots      []*slotEntry `json:"slots"`
 	TotalCount int          `json:"total_count"`
-	NextSlot   uint64       `json:"next_slot"`
+	Page       int          `json:"page"`
+	NextPage   *int         `json:"next_page"`
 }
 
 type slotEntry struct {
@@ -119,18 +121,11 @@ func (s *service) GetOrphanedBlocks(ctx context.Context, startSlot, endSlot uint
 
 	var orphanedBlocks []*OrphanedBlock
 
-	// Paginate through all orphaned blocks using next_slot
-	nextSlot := int64(-1) // -1 means start from head
+	page := 0
 
 	for {
-		var url string
-		if nextSlot < 0 {
-			url = fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100",
-				strings.TrimSuffix(s.cfg.URL, "/"))
-		} else {
-			url = fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100&start_slot=%d",
-				strings.TrimSuffix(s.cfg.URL, "/"), nextSlot)
-		}
+		url := fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100&page=%d",
+			strings.TrimSuffix(s.cfg.URL, "/"), page)
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
@@ -186,14 +181,18 @@ func (s *service) GetOrphanedBlocks(ctx context.Context, startSlot, endSlot uint
 			})
 		}
 
-		// Check if we should continue pagination
-		if slotsResp.Data.NextSlot == 0 || slotsResp.Data.NextSlot < startSlot {
+		// Stop if we've gone past the slot range
+		if minSlotInBatch < startSlot {
 			break
 		}
 
-		nextSlot = int64(slotsResp.Data.NextSlot)
+		// Check if there's a next page
+		if slotsResp.Data.NextPage == nil {
+			break
+		}
 
-		// Avoid tight loops
+		page = *slotsResp.Data.NextPage
+
 		select {
 		case <-ctx.Done():
 			return orphanedBlocks, ctx.Err()
@@ -559,29 +558,75 @@ func parseSignature(s string) (phase0.BLSSignature, error) {
 	return sig, nil
 }
 
-// GetAllDoubleProposals fetches all orphaned blocks and checks each against canonical
-// blocks to find double-proposals (same proposer for both canonical and orphaned block).
+// validatorResponse represents the Dora API response for /v1/validator/{index}.
+type validatorResponse struct {
+	Status string         `json:"status"`
+	Data   *validatorData `json:"data"`
+}
+
+type validatorData struct {
+	Index  uint64 `json:"index"`
+	Status string `json:"status"`
+}
+
+// IsValidatorSlashed checks if a validator is already slashed via Dora API.
+func (s *service) IsValidatorSlashed(
+	ctx context.Context,
+	validatorIndex phase0.ValidatorIndex,
+) (bool, error) {
+	if !s.cfg.Enabled {
+		return false, nil
+	}
+
+	url := fmt.Sprintf("%s/api/v1/validator/%d", strings.TrimSuffix(s.cfg.URL, "/"), validatorIndex)
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return false, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	resp, err := s.client.Do(req)
+	if err != nil {
+		return false, fmt.Errorf("failed to fetch validator: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return false, fmt.Errorf("dora API returned status %d", resp.StatusCode)
+	}
+
+	var valResp validatorResponse
+	if err := json.NewDecoder(resp.Body).Decode(&valResp); err != nil {
+		return false, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	if valResp.Data == nil {
+		return false, nil
+	}
+
+	// Check if status contains "slashed"
+	status := strings.ToLower(valResp.Data.Status)
+
+	return strings.Contains(status, "slashed"), nil
+}
+
+// GetAllDoubleProposals fetches all orphaned blocks from genesis using page-based pagination
+// and checks each against canonical blocks to find double-proposals.
 func (s *service) GetAllDoubleProposals(ctx context.Context) ([]*DoubleProposal, error) {
 	if !s.cfg.Enabled {
 		return nil, nil
 	}
 
-	s.log.Info("fetching all orphaned blocks from dora")
+	s.log.Info("fetching all orphaned blocks from dora (from genesis)")
 
+	// Fetch all orphaned blocks using page-based pagination
 	var allOrphaned []*slotEntry
 
-	// Paginate through all orphaned blocks
-	nextSlot := int64(-1)
+	page := 0
 
 	for {
-		var url string
-		if nextSlot < 0 {
-			url = fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100",
-				strings.TrimSuffix(s.cfg.URL, "/"))
-		} else {
-			url = fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100&start_slot=%d",
-				strings.TrimSuffix(s.cfg.URL, "/"), nextSlot)
-		}
+		url := fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100&page=%d",
+			strings.TrimSuffix(s.cfg.URL, "/"), page)
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {
@@ -615,16 +660,18 @@ func (s *service) GetAllDoubleProposals(ctx context.Context) ([]*DoubleProposal,
 		allOrphaned = append(allOrphaned, slotsResp.Data.Slots...)
 
 		s.log.WithFields(logrus.Fields{
+			"page":      page,
 			"fetched":   len(slotsResp.Data.Slots),
 			"total":     len(allOrphaned),
-			"next_slot": slotsResp.Data.NextSlot,
+			"next_page": slotsResp.Data.NextPage,
 		}).Debug("fetched orphaned blocks batch")
 
-		if slotsResp.Data.NextSlot == 0 {
+		// Check if there's a next page
+		if slotsResp.Data.NextPage == nil {
 			break
 		}
 
-		nextSlot = int64(slotsResp.Data.NextSlot)
+		page = *slotsResp.Data.NextPage
 
 		select {
 		case <-ctx.Done():
@@ -638,7 +685,7 @@ func (s *service) GetAllDoubleProposals(ctx context.Context) ([]*DoubleProposal,
 	// Check each orphaned block against its canonical counterpart
 	var doubleProposals []*DoubleProposal
 
-	for _, orphaned := range allOrphaned {
+	for i, orphaned := range allOrphaned {
 		if ctx.Err() != nil {
 			return doubleProposals, ctx.Err()
 		}
@@ -680,6 +727,15 @@ func (s *service) GetAllDoubleProposals(ctx context.Context) ([]*DoubleProposal,
 				CanonicalRoot: canonical.BlockRoot,
 				OrphanedRoot:  orphanedRoot,
 			})
+		}
+
+		// Log progress every 50 blocks
+		if (i+1)%50 == 0 {
+			s.log.WithFields(logrus.Fields{
+				"processed":        i + 1,
+				"total":            len(allOrphaned),
+				"double_proposals": len(doubleProposals),
+			}).Info("scanning progress")
 		}
 
 		// Rate limit API calls

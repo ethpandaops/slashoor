@@ -347,11 +347,32 @@ func (s *service) scanDoraHistorical() error {
 	s.log.WithField("double_proposals", len(doubleProposals)).
 		Info("found double-proposals to process")
 
-	var slashingsCreated uint64
+	var (
+		slashingsCreated uint64
+		skippedSlashed   uint64
+	)
 
 	for _, dp := range doubleProposals {
 		if s.ctx.Err() != nil {
 			return s.ctx.Err()
+		}
+
+		// Check if validator is already slashed
+		isSlashed, err := s.dora.IsValidatorSlashed(s.ctx, dp.ProposerIndex)
+		if err != nil {
+			s.log.WithError(err).WithField("proposer_index", dp.ProposerIndex).
+				Debug("failed to check validator slashed status")
+		}
+
+		if isSlashed {
+			s.log.WithFields(logrus.Fields{
+				"slot":           dp.Slot,
+				"proposer_index": dp.ProposerIndex,
+			}).Debug("validator already slashed, skipping")
+
+			skippedSlashed++
+
+			continue
 		}
 
 		s.log.WithFields(logrus.Fields{
@@ -379,8 +400,10 @@ func (s *service) scanDoraHistorical() error {
 		}
 	}
 
-	s.log.WithField("slashings_created", slashingsCreated).
-		Info("dora historical scan complete")
+	s.log.WithFields(logrus.Fields{
+		"slashings_created": slashingsCreated,
+		"skipped_slashed":   skippedSlashed,
+	}).Info("dora historical scan complete")
 
 	return nil
 }

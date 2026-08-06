@@ -138,6 +138,23 @@ func TestResolvePhase0Validators(t *testing.T) {
 	}
 }
 
+func TestRedactEndpoint(t *testing.T) {
+	tests := []struct {
+		in   string
+		want string
+	}{
+		{in: "https://eth:secret@bn-node.example.com", want: "https://bn-node.example.com"},
+		{in: "https://bn-node.example.com", want: "https://bn-node.example.com"},
+		{in: "http://user@localhost:5052", want: "http://localhost:5052"},
+	}
+
+	for _, tt := range tests {
+		if got := redactEndpoint(tt.in); got != tt.want {
+			t.Fatalf("redactEndpoint(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+}
+
 func TestForkVersionOrdering(t *testing.T) {
 	if NewerForkVersion("electra", "phase0") != "electra" {
 		t.Fatal("electra should rank above phase0")

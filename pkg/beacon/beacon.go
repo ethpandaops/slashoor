@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -157,10 +159,30 @@ type Service interface {
 
 type node struct {
 	endpoint string
-	client   *http.Client
-	stream   *Stream
-	healthy  bool
-	mu       sync.RWMutex
+	// display is the endpoint with any userinfo stripped — endpoints can
+	// carry basic-auth credentials, so only display may ever be logged.
+	display string
+	client  *http.Client
+	stream  *Stream
+	healthy bool
+	mu      sync.RWMutex
+}
+
+// redactEndpoint strips userinfo from an endpoint URL for safe logging.
+func redactEndpoint(endpoint string) string {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		// Unparseable: fall back to dropping anything before an '@'.
+		if i := strings.LastIndex(endpoint, "@"); i >= 0 {
+			return "<redacted>@" + endpoint[i+1:]
+		}
+
+		return endpoint
+	}
+
+	u.User = nil
+
+	return u.String()
 }
 
 type committeeKey struct {
@@ -191,6 +213,7 @@ func New(cfg *Config, log logrus.FieldLogger) Service {
 	for _, endpoint := range cfg.Endpoints {
 		nodes = append(nodes, &node{
 			endpoint: endpoint,
+			display:  redactEndpoint(endpoint),
 			client: &http.Client{
 				Timeout: cfg.Timeout,
 			},
@@ -217,8 +240,13 @@ func (s *service) Start(ctx context.Context) error {
 
 	go s.cleanupCommitteeCache(ctx)
 
+	displays := make([]string, 0, len(s.nodes))
+	for _, n := range s.nodes {
+		displays = append(displays, n.display)
+	}
+
 	s.log.WithFields(logrus.Fields{
-		"endpoints":       s.cfg.Endpoints,
+		"endpoints":       displays,
 		"slots_per_epoch": s.slotsPerEpoch,
 	}).Info("beacon service started")
 
@@ -305,9 +333,14 @@ func (s *service) cleanupCommitteeCache(ctx context.Context) {
 	}
 }
 
-// GetFinality retrieves the current finality checkpoints.
+// GetFinality retrieves the current finality checkpoints, taking the most
+// advanced head across all healthy nodes so a lagging node cannot anchor the
+// view of the chain behind the real head.
 func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
-	var lastErr error
+	var (
+		lastErr error
+		best    *Finality
+	)
 
 	for _, n := range s.getHealthyNodes() {
 		resp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/states/head/finality_checkpoints", nil, nil)
@@ -373,11 +406,19 @@ func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
 
 		s.markNodeHealthy(n)
 
-		return &Finality{
-			FinalizedEpoch: phase0.Epoch(finalizedEpoch),
-			FinalizedSlot:  phase0.Slot(finalizedEpoch * s.slotsPerEpoch),
-			HeadSlot:       phase0.Slot(headSlot),
-		}, nil
+		// Keep the most advanced view: a stuck or lagging node would otherwise
+		// anchor backfill thousands of slots behind the real head.
+		if best == nil || phase0.Slot(headSlot) > best.HeadSlot {
+			best = &Finality{
+				FinalizedEpoch: phase0.Epoch(finalizedEpoch),
+				FinalizedSlot:  phase0.Slot(finalizedEpoch * s.slotsPerEpoch),
+				HeadSlot:       phase0.Slot(headSlot),
+			}
+		}
+	}
+
+	if best != nil {
+		return best, nil
 	}
 
 	if lastErr != nil {
@@ -505,7 +546,10 @@ func (s *service) GetBlockAttestations(
 ) ([]*Attestation, error) {
 	path := fmt.Sprintf("/eth/v2/beacon/blocks/%d/attestations", slot)
 
-	var lastErr error
+	var (
+		lastErr  error
+		notFound bool
+	)
 
 	for _, n := range s.getHealthyNodes() {
 		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil, nil)
@@ -516,11 +560,18 @@ func (s *service) GetBlockAttestations(
 			continue
 		}
 
-		defer func() { _ = resp.Body.Close() }()
-
+		// A single node's 404 is not authoritative: a stuck or pruned node
+		// answering first would silently blind the slasher. The block only
+		// counts as missing once every healthy node says so.
 		if resp.StatusCode == http.StatusNotFound {
-			return nil, nil
+			_ = resp.Body.Close()
+
+			notFound = true
+
+			continue
 		}
+
+		defer func() { _ = resp.Body.Close() }()
 
 		var result struct {
 			Version string            `json:"version"`
@@ -549,6 +600,10 @@ func (s *service) GetBlockAttestations(
 		return attestations, nil
 	}
 
+	if notFound {
+		return nil, nil
+	}
+
 	if lastErr != nil {
 		return nil, lastErr
 	}
@@ -563,7 +618,10 @@ func (s *service) GetSignedBlockHeader(
 ) (*SignedBeaconBlockHeader, error) {
 	path := fmt.Sprintf("/eth/v1/beacon/headers/0x%x", blockRoot)
 
-	var lastErr error
+	var (
+		lastErr  error
+		notFound bool
+	)
 
 	for _, n := range s.getHealthyNodes() {
 		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil, nil)
@@ -574,11 +632,17 @@ func (s *service) GetSignedBlockHeader(
 			continue
 		}
 
-		defer func() { _ = resp.Body.Close() }()
-
+		// A single node's 404 is not authoritative — orphaned blocks in
+		// particular are only stored by nodes that saw them; keep asking.
 		if resp.StatusCode == http.StatusNotFound {
-			return nil, nil
+			_ = resp.Body.Close()
+
+			notFound = true
+
+			continue
 		}
+
+		defer func() { _ = resp.Body.Close() }()
 
 		var result struct {
 			Data struct {
@@ -620,6 +684,10 @@ func (s *service) GetSignedBlockHeader(
 			},
 			Signature: sig,
 		}, nil
+	}
+
+	if notFound {
+		return nil, nil
 	}
 
 	if lastErr != nil {
@@ -793,10 +861,10 @@ func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *Attester
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
 			successCount++
 
-			s.log.WithField("endpoint", n.endpoint).Debug("submitted slashing to node")
+			s.log.WithField("endpoint", n.display).Debug("submitted slashing to node")
 		} else {
 			s.log.WithFields(logrus.Fields{
-				"endpoint": n.endpoint,
+				"endpoint": n.display,
 				"status":   resp.StatusCode,
 			}).Warn("failed to submit slashing")
 		}
@@ -913,10 +981,10 @@ func (s *service) SubmitProposerSlashing(ctx context.Context, slashing *Proposer
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
 			successCount++
 
-			s.log.WithField("endpoint", n.endpoint).Debug("submitted proposer slashing to node")
+			s.log.WithField("endpoint", n.display).Debug("submitted proposer slashing to node")
 		} else {
 			s.log.WithFields(logrus.Fields{
-				"endpoint": n.endpoint,
+				"endpoint": n.display,
 				"status":   resp.StatusCode,
 			}).Warn("failed to submit proposer slashing")
 		}
@@ -1017,7 +1085,7 @@ func (s *service) subscribeNode(
 	n *node,
 	handler func(*HeadEvent),
 ) {
-	log := s.log.WithField("endpoint", n.endpoint)
+	log := s.log.WithField("endpoint", n.display)
 
 	n.stream = NewStream(n.endpoint, log)
 
@@ -1084,7 +1152,7 @@ func (s *service) subscribeNodeBlocks(
 	n *node,
 	handler func(*BlockEvent),
 ) {
-	log := s.log.WithField("endpoint", n.endpoint)
+	log := s.log.WithField("endpoint", n.display)
 
 	stream := NewStream(n.endpoint, log)
 
@@ -1153,7 +1221,7 @@ func (s *service) markNodeUnhealthy(n *node) {
 
 	if n.healthy {
 		n.healthy = false
-		s.log.WithField("endpoint", n.endpoint).Warn("beacon node marked unhealthy")
+		s.log.WithField("endpoint", n.display).Warn("beacon node marked unhealthy")
 	}
 }
 
@@ -1163,7 +1231,7 @@ func (s *service) markNodeHealthy(n *node) {
 
 	if !n.healthy {
 		n.healthy = true
-		s.log.WithField("endpoint", n.endpoint).Info("beacon node marked healthy")
+		s.log.WithField("endpoint", n.display).Info("beacon node marked healthy")
 	}
 }
 

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"slices"
 	"sync"
 	"time"
 
@@ -38,10 +39,17 @@ type Checkpoint struct {
 }
 
 // Attestation represents an attestation from a block.
+// For Electra and later, AggregationBits concatenates the participation bits
+// of every committee flagged in CommitteeBits (EIP-7549); CommitteeBits is
+// empty for pre-Electra attestations, where Data.Index selects the committee.
 type Attestation struct {
 	AggregationBits []byte
+	CommitteeBits   []byte
 	Data            *AttestationData
 	Signature       phase0.BLSSignature
+	// Version is the consensus fork name of the block the attestation was
+	// read from, as reported by the beacon API (e.g. "electra").
+	Version string
 }
 
 // IndexedAttestation represents an attestation with validator indices.
@@ -55,6 +63,33 @@ type IndexedAttestation struct {
 type AttesterSlashing struct {
 	Attestation1 *IndexedAttestation
 	Attestation2 *IndexedAttestation
+	// Version is the consensus fork name governing the slashing's container
+	// shape, used for the Eth-Consensus-Version header on submission.
+	Version string
+}
+
+// forkOrder lists consensus fork names oldest-first. Unknown names rank
+// newest, so future forks keep the Electra-shaped containers and endpoints
+// until this list says otherwise.
+var forkOrder = []string{"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+
+func forkRank(version string) int {
+	for i, name := range forkOrder {
+		if name == version {
+			return i
+		}
+	}
+
+	return len(forkOrder)
+}
+
+// NewerForkVersion returns whichever of the two fork names is more recent.
+func NewerForkVersion(a, b string) string {
+	if forkRank(b) > forkRank(a) {
+		return b
+	}
+
+	return a
 }
 
 // Committee represents a beacon committee.
@@ -141,6 +176,10 @@ type service struct {
 	committeeMu    sync.RWMutex
 	committeeCache map[committeeKey][]phase0.ValidatorIndex
 
+	// slotsPerEpoch is read from /eth/v1/config/spec at startup; written only
+	// in Start, before any concurrent readers exist.
+	slotsPerEpoch uint64
+
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
@@ -164,6 +203,7 @@ func New(cfg *Config, log logrus.FieldLogger) Service {
 		log:            log.WithField("package", "beacon"),
 		nodes:          nodes,
 		committeeCache: make(map[committeeKey][]phase0.ValidatorIndex, 2048),
+		slotsPerEpoch:  32,
 	}
 }
 
@@ -173,11 +213,51 @@ func (s *service) Start(ctx context.Context) error {
 		return fmt.Errorf("invalid config: %w", err)
 	}
 
+	s.fetchSpec(ctx)
+
 	go s.cleanupCommitteeCache(ctx)
 
-	s.log.WithField("endpoints", s.cfg.Endpoints).Info("beacon service started")
+	s.log.WithFields(logrus.Fields{
+		"endpoints":       s.cfg.Endpoints,
+		"slots_per_epoch": s.slotsPerEpoch,
+	}).Info("beacon service started")
 
 	return nil
+}
+
+// fetchSpec reads chain parameters from the beacon node. Failures are
+// non-fatal; mainnet defaults are kept.
+func (s *service) fetchSpec(ctx context.Context) {
+	for _, n := range s.getHealthyNodes() {
+		resp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/config/spec", nil, nil)
+		if err != nil {
+			continue
+		}
+
+		var result struct {
+			Data struct {
+				SlotsPerEpoch string `json:"SLOTS_PER_EPOCH"`
+			} `json:"data"`
+		}
+
+		err = json.NewDecoder(resp.Body).Decode(&result)
+
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			s.log.WithError(closeErr).Debug("failed to close spec response body")
+		}
+
+		if err != nil {
+			continue
+		}
+
+		if v, err := parseUint64(result.Data.SlotsPerEpoch); err == nil && v > 0 {
+			s.slotsPerEpoch = v
+
+			return
+		}
+	}
+
+	s.log.Warn("failed to fetch chain spec, using default SLOTS_PER_EPOCH=32")
 }
 
 // Stop shuts down the beacon service.
@@ -230,15 +310,13 @@ func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
 	var lastErr error
 
 	for _, n := range s.getHealthyNodes() {
-		resp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/states/head/finality_checkpoints", nil)
+		resp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/states/head/finality_checkpoints", nil, nil)
 		if err != nil {
 			lastErr = err
 			s.markNodeUnhealthy(n)
 
 			continue
 		}
-
-		defer resp.Body.Close()
 
 		var result struct {
 			Data struct {
@@ -248,7 +326,13 @@ func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
 			} `json:"data"`
 		}
 
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		err = json.NewDecoder(resp.Body).Decode(&result)
+
+		if closeErr := resp.Body.Close(); closeErr != nil {
+			s.log.WithError(closeErr).Debug("failed to close finality response body")
+		}
+
+		if err != nil {
 			lastErr = fmt.Errorf("failed to decode finality response: %w", err)
 
 			continue
@@ -256,14 +340,12 @@ func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
 
 		finalizedEpoch, _ := parseUint64(result.Data.Finalized.Epoch)
 
-		headResp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/headers/head", nil)
+		headResp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/headers/head", nil, nil)
 		if err != nil {
 			lastErr = err
 
 			continue
 		}
-
-		defer headResp.Body.Close()
 
 		var headResult struct {
 			Data struct {
@@ -275,7 +357,13 @@ func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
 			} `json:"data"`
 		}
 
-		if err := json.NewDecoder(headResp.Body).Decode(&headResult); err != nil {
+		err = json.NewDecoder(headResp.Body).Decode(&headResult)
+
+		if closeErr := headResp.Body.Close(); closeErr != nil {
+			s.log.WithError(closeErr).Debug("failed to close head response body")
+		}
+
+		if err != nil {
 			lastErr = fmt.Errorf("failed to decode head response: %w", err)
 
 			continue
@@ -287,7 +375,7 @@ func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
 
 		return &Finality{
 			FinalizedEpoch: phase0.Epoch(finalizedEpoch),
-			FinalizedSlot:  phase0.Slot(finalizedEpoch * 32),
+			FinalizedSlot:  phase0.Slot(finalizedEpoch * s.slotsPerEpoch),
 			HeadSlot:       phase0.Slot(headSlot),
 		}, nil
 	}
@@ -300,60 +388,29 @@ func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
 }
 
 // GetCommittees retrieves beacon committees for a specific slot.
+// The state at the attestation's own slot is tried first: head can only
+// compute committees for slots near its shuffling window, so head-only
+// queries return errors (or nothing) for backfilled historical slots. Head
+// remains the fallback for nodes that have pruned the older state.
 func (s *service) GetCommittees(ctx context.Context, slot phase0.Slot) ([]*Committee, error) {
-	path := fmt.Sprintf("/eth/v1/beacon/states/head/committees?slot=%d", slot)
+	paths := []string{
+		fmt.Sprintf("/eth/v1/beacon/states/%d/committees?slot=%d", slot, slot),
+		fmt.Sprintf("/eth/v1/beacon/states/head/committees?slot=%d", slot),
+	}
 
 	var lastErr error
 
-	for _, n := range s.getHealthyNodes() {
-		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil)
-		if err != nil {
-			lastErr = err
-			s.markNodeUnhealthy(n)
+	for _, path := range paths {
+		for _, n := range s.getHealthyNodes() {
+			committees, err := s.getCommitteesFrom(ctx, n, path)
+			if err != nil {
+				lastErr = err
 
-			continue
-		}
-
-		defer resp.Body.Close()
-
-		var result struct {
-			Data []struct {
-				Index      string   `json:"index"`
-				Slot       string   `json:"slot"`
-				Validators []string `json:"validators"`
-			} `json:"data"`
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			lastErr = fmt.Errorf("failed to decode committees response: %w", err)
-
-			continue
-		}
-
-		committees := make([]*Committee, 0, len(result.Data))
-
-		for _, c := range result.Data {
-			idx, _ := parseUint64(c.Index)
-			cSlot, _ := parseUint64(c.Slot)
-
-			validators := make([]phase0.ValidatorIndex, 0, len(c.Validators))
-			for _, v := range c.Validators {
-				vidx, _ := parseUint64(v)
-				validators = append(validators, phase0.ValidatorIndex(vidx))
+				continue
 			}
 
-			committee := &Committee{
-				Index:      phase0.CommitteeIndex(idx),
-				Slot:       phase0.Slot(cSlot),
-				Validators: validators,
-			}
-
-			committees = append(committees, committee)
-
-			s.cacheCommittee(committee)
+			return committees, nil
 		}
-
-		return committees, nil
 	}
 
 	if lastErr != nil {
@@ -361,6 +418,66 @@ func (s *service) GetCommittees(ctx context.Context, slot phase0.Slot) ([]*Commi
 	}
 
 	return nil, ErrAllNodesFailed
+}
+
+func (s *service) getCommitteesFrom(
+	ctx context.Context,
+	n *node,
+	path string,
+) ([]*Committee, error) {
+	resp, err := s.doNodeRequest(ctx, n, "GET", path, nil, nil)
+	if err != nil {
+		s.markNodeUnhealthy(n)
+
+		return nil, err
+	}
+
+	defer func() {
+		if err := resp.Body.Close(); err != nil {
+			s.log.WithError(err).Debug("failed to close committees response body")
+		}
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: committees request returned status %d", ErrRequestFailed, resp.StatusCode)
+	}
+
+	var result struct {
+		Data []struct {
+			Index      string   `json:"index"`
+			Slot       string   `json:"slot"`
+			Validators []string `json:"validators"`
+		} `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode committees response: %w", err)
+	}
+
+	committees := make([]*Committee, 0, len(result.Data))
+
+	for _, c := range result.Data {
+		idx, _ := parseUint64(c.Index)
+		cSlot, _ := parseUint64(c.Slot)
+
+		validators := make([]phase0.ValidatorIndex, 0, len(c.Validators))
+		for _, v := range c.Validators {
+			vidx, _ := parseUint64(v)
+			validators = append(validators, phase0.ValidatorIndex(vidx))
+		}
+
+		committee := &Committee{
+			Index:      phase0.CommitteeIndex(idx),
+			Slot:       phase0.Slot(cSlot),
+			Validators: validators,
+		}
+
+		committees = append(committees, committee)
+
+		s.cacheCommittee(committee)
+	}
+
+	return committees, nil
 }
 
 func (s *service) cacheCommittee(c *Committee) {
@@ -386,12 +503,12 @@ func (s *service) GetBlockAttestations(
 	ctx context.Context,
 	slot phase0.Slot,
 ) ([]*Attestation, error) {
-	path := fmt.Sprintf("/eth/v1/beacon/blocks/%d/attestations", slot)
+	path := fmt.Sprintf("/eth/v2/beacon/blocks/%d/attestations", slot)
 
 	var lastErr error
 
 	for _, n := range s.getHealthyNodes() {
-		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil)
+		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil, nil)
 		if err != nil {
 			lastErr = err
 			s.markNodeUnhealthy(n)
@@ -399,14 +516,15 @@ func (s *service) GetBlockAttestations(
 			continue
 		}
 
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, nil
 		}
 
 		var result struct {
-			Data []json.RawMessage `json:"data"`
+			Version string            `json:"version"`
+			Data    []json.RawMessage `json:"data"`
 		}
 
 		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
@@ -418,7 +536,7 @@ func (s *service) GetBlockAttestations(
 		attestations := make([]*Attestation, 0, len(result.Data))
 
 		for _, raw := range result.Data {
-			att, err := s.parseAttestation(raw)
+			att, err := s.parseAttestation(raw, result.Version)
 			if err != nil {
 				s.log.WithError(err).Debug("failed to parse attestation")
 
@@ -448,7 +566,7 @@ func (s *service) GetSignedBlockHeader(
 	var lastErr error
 
 	for _, n := range s.getHealthyNodes() {
-		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil)
+		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil, nil)
 		if err != nil {
 			lastErr = err
 			s.markNodeUnhealthy(n)
@@ -456,7 +574,7 @@ func (s *service) GetSignedBlockHeader(
 			continue
 		}
 
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 
 		if resp.StatusCode == http.StatusNotFound {
 			return nil, nil
@@ -511,22 +629,77 @@ func (s *service) GetSignedBlockHeader(
 	return nil, ErrAllNodesFailed
 }
 
-// ResolveAttestingValidators resolves the attesting validators for an attestation.
+// ResolveAttestingValidators resolves the attesting validators for an
+// attestation, returned sorted ascending as required for attesting_indices.
 func (s *service) ResolveAttestingValidators(
 	ctx context.Context,
 	att *Attestation,
 ) ([]phase0.ValidatorIndex, error) {
-	committee := s.getCachedCommittee(att.Data.Slot, att.Data.Index)
+	var (
+		validators []phase0.ValidatorIndex
+		err        error
+	)
 
-	if committee == nil {
-		if _, err := s.GetCommittees(ctx, att.Data.Slot); err != nil {
-			return nil, fmt.Errorf("failed to fetch committees: %w", err)
+	if len(att.CommitteeBits) > 0 {
+		validators, err = s.resolveElectraValidators(ctx, att)
+	} else {
+		validators, err = s.resolvePhase0Validators(ctx, att)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	slices.Sort(validators)
+
+	return validators, nil
+}
+
+// resolveElectraValidators handles EIP-7549 attestations: aggregation_bits is
+// the concatenation of the participation bits of every committee flagged in
+// committee_bits, in increasing committee order.
+func (s *service) resolveElectraValidators(
+	ctx context.Context,
+	att *Attestation,
+) ([]phase0.ValidatorIndex, error) {
+	validators := make([]phase0.ValidatorIndex, 0, 128)
+	offset := 0
+
+	for _, committeeIdx := range committeeIndicesFromBits(att.CommitteeBits) {
+		committee, err := s.committeeAt(ctx, att.Data.Slot, committeeIdx)
+		if err != nil {
+			return nil, err
 		}
 
-		committee = s.getCachedCommittee(att.Data.Slot, att.Data.Index)
-		if committee == nil {
-			return nil, fmt.Errorf("committee not found for slot %d index %d", att.Data.Slot, att.Data.Index)
+		for i, validatorIdx := range committee {
+			bit := offset + i
+			if bit >= len(att.AggregationBits)*8 {
+				return nil, fmt.Errorf(
+					"aggregation bits (%d bits) shorter than combined committee size at slot %d",
+					len(att.AggregationBits)*8, att.Data.Slot,
+				)
+			}
+
+			if att.AggregationBits[bit/8]&(1<<(bit%8)) != 0 {
+				validators = append(validators, validatorIdx)
+			}
 		}
+
+		offset += len(committee)
+	}
+
+	return validators, nil
+}
+
+// resolvePhase0Validators handles pre-Electra attestations, where data.index
+// selects the single committee covered by aggregation_bits.
+func (s *service) resolvePhase0Validators(
+	ctx context.Context,
+	att *Attestation,
+) ([]phase0.ValidatorIndex, error) {
+	committee, err := s.committeeAt(ctx, att.Data.Slot, att.Data.Index)
+	if err != nil {
+		return nil, err
 	}
 
 	validators := make([]phase0.ValidatorIndex, 0, len(committee))
@@ -536,15 +709,48 @@ func (s *service) ResolveAttestingValidators(
 			break
 		}
 
-		byteIdx := i / 8
-		bitIdx := i % 8
-
-		if att.AggregationBits[byteIdx]&(1<<bitIdx) != 0 {
+		if att.AggregationBits[i/8]&(1<<(i%8)) != 0 {
 			validators = append(validators, validatorIdx)
 		}
 	}
 
 	return validators, nil
+}
+
+// committeeIndicesFromBits returns the committee indices flagged in a
+// committee_bits bitvector, in increasing order.
+func committeeIndicesFromBits(bits []byte) []phase0.CommitteeIndex {
+	indices := make([]phase0.CommitteeIndex, 0, 8)
+
+	for i := 0; i < len(bits)*8; i++ {
+		if bits[i/8]&(1<<(i%8)) != 0 {
+			indices = append(indices, phase0.CommitteeIndex(i))
+		}
+	}
+
+	return indices
+}
+
+func (s *service) committeeAt(
+	ctx context.Context,
+	slot phase0.Slot,
+	index phase0.CommitteeIndex,
+) ([]phase0.ValidatorIndex, error) {
+	committee := s.getCachedCommittee(slot, index)
+	if committee != nil {
+		return committee, nil
+	}
+
+	if _, err := s.GetCommittees(ctx, slot); err != nil {
+		return nil, fmt.Errorf("failed to fetch committees: %w", err)
+	}
+
+	committee = s.getCachedCommittee(slot, index)
+	if committee == nil {
+		return nil, fmt.Errorf("committee not found for slot %d index %d", slot, index)
+	}
+
+	return committee, nil
 }
 
 // SubmitAttesterSlashing submits an attester slashing to all beacon nodes.
@@ -554,20 +760,35 @@ func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *Attester
 		return fmt.Errorf("failed to marshal slashing: %w", err)
 	}
 
+	// The Electra-shaped AttesterSlashing must go to the v2 pool endpoint with
+	// an Eth-Consensus-Version header; only pre-Electra proofs use v1.
+	version := slashing.Version
+	if version == "" {
+		version = "electra"
+	}
+
+	path := "/eth/v2/beacon/pool/attester_slashings"
+	headers := map[string]string{"Eth-Consensus-Version": version}
+
+	if forkRank(version) < forkRank("electra") {
+		path = "/eth/v1/beacon/pool/attester_slashings"
+		headers = nil
+	}
+
 	var (
 		successCount int
 		lastErr      error
 	)
 
 	for _, n := range s.nodes {
-		resp, err := s.doNodeRequest(ctx, n, "POST", "/eth/v1/beacon/pool/attester_slashings", body)
+		resp, err := s.doNodeRequest(ctx, n, "POST", path, body, headers)
 		if err != nil {
 			lastErr = err
 
 			continue
 		}
 
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
 			successCount++
@@ -680,14 +901,14 @@ func (s *service) SubmitProposerSlashing(ctx context.Context, slashing *Proposer
 	)
 
 	for _, n := range s.nodes {
-		resp, err := s.doNodeRequest(ctx, n, "POST", "/eth/v1/beacon/pool/proposer_slashings", body)
+		resp, err := s.doNodeRequest(ctx, n, "POST", "/eth/v1/beacon/pool/proposer_slashings", body, nil)
 		if err != nil {
 			lastErr = err
 
 			continue
 		}
 
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
 			successCount++
@@ -951,6 +1172,7 @@ func (s *service) doNodeRequest(
 	n *node,
 	method, path string,
 	body []byte,
+	headers map[string]string,
 ) (*http.Response, error) {
 	url := n.endpoint + path
 
@@ -969,6 +1191,10 @@ func (s *service) doNodeRequest(
 		req.Header.Set("Content-Type", "application/json")
 	}
 
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+
 	resp, err := n.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("request failed: %w", err)
@@ -977,9 +1203,10 @@ func (s *service) doNodeRequest(
 	return resp, nil
 }
 
-func (s *service) parseAttestation(raw json.RawMessage) (*Attestation, error) {
+func (s *service) parseAttestation(raw json.RawMessage, version string) (*Attestation, error) {
 	var att struct {
 		AggregationBits string `json:"aggregation_bits"`
+		CommitteeBits   string `json:"committee_bits"`
 		Data            struct {
 			Slot            string `json:"slot"`
 			Index           string `json:"index"`
@@ -1011,8 +1238,15 @@ func (s *service) parseAttestation(raw json.RawMessage) (*Attestation, error) {
 	sig, _ := parseSignature(att.Signature)
 	aggBits, _ := parseAggregationBits(att.AggregationBits)
 
+	var committeeBits []byte
+	if att.CommitteeBits != "" {
+		committeeBits, _ = parseAggregationBits(att.CommitteeBits)
+	}
+
 	return &Attestation{
 		AggregationBits: aggBits,
+		CommitteeBits:   committeeBits,
+		Version:         version,
 		Data: &AttestationData{
 			Slot:            phase0.Slot(slot),
 			Index:           phase0.CommitteeIndex(index),

@@ -96,17 +96,25 @@ func (s *service) HandleCandidate(ctx context.Context, candidate *indexer.Slashi
 		return
 	}
 
+	// Each IndexedAttestation must carry its own full attesting set: the
+	// aggregate signature covers every participant, so submitting only the
+	// overlap fails is_valid_indexed_attestation on the node. The overlap
+	// check above only gates whether the pair is slashable at all.
 	slashing := &beacon.AttesterSlashing{
 		Attestation1: &beacon.IndexedAttestation{
-			AttestingIndices: overlap,
+			AttestingIndices: validators1,
 			Data:             candidate.Attestation1.Data,
 			Signature:        candidate.Attestation1.Signature,
 		},
 		Attestation2: &beacon.IndexedAttestation{
-			AttestingIndices: overlap,
+			AttestingIndices: validators2,
 			Data:             candidate.Attestation2.Data,
 			Signature:        candidate.Attestation2.Signature,
 		},
+		Version: beacon.NewerForkVersion(
+			candidate.Attestation1.Version,
+			candidate.Attestation2.Version,
+		),
 	}
 
 	s.mu.Lock()

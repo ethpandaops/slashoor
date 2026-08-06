@@ -81,6 +81,44 @@ func (s *service) Stop() error {
 	return nil
 }
 
+// doGet performs a GET with retries on rate limiting and transient server
+// errors; the public Dora ingress 429s under the scan's request volume.
+func (s *service) doGet(ctx context.Context, url string) (*http.Response, error) {
+	backoff := 2 * time.Second
+
+	for attempt := 0; ; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create request: %w", err)
+		}
+
+		resp, err := s.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+
+		retryable := resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= http.StatusInternalServerError
+		if !retryable || attempt >= 4 {
+			return resp, nil
+		}
+
+		_ = resp.Body.Close()
+
+		s.log.WithFields(logrus.Fields{
+			"status":  resp.StatusCode,
+			"backoff": backoff,
+		}).Debug("dora request throttled, retrying")
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+
+		backoff *= 2
+	}
+}
+
 // slotsResponse represents the Dora API response for /v1/slots.
 type slotsResponse struct {
 	Status string     `json:"status"`
@@ -127,36 +165,31 @@ func (s *service) GetOrphanedBlocks(ctx context.Context, startSlot, endSlot uint
 		url := fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100&page=%d",
 			strings.TrimSuffix(s.cfg.URL, "/"), page)
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		resp, err := s.client.Do(req)
+		resp, err := s.doGet(ctx, url)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch orphaned blocks: %w", err)
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			return nil, fmt.Errorf("dora API returned status %d", resp.StatusCode)
 		}
 
 		var slotsResp slotsResponse
 		if err := json.NewDecoder(resp.Body).Decode(&slotsResp); err != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if slotsResp.Data == nil || len(slotsResp.Data.Slots) == 0 {
 			break
 		}
 
-		var minSlotInBatch uint64 = ^uint64(0)
+		minSlotInBatch := ^uint64(0)
 
 		for _, slot := range slotsResp.Data.Slots {
 			if slot.Slot < minSlotInBatch {
@@ -266,16 +299,11 @@ type slotResponse struct {
 func (s *service) getCanonicalBlock(ctx context.Context, slot uint64) (*OrphanedBlock, error) {
 	url := fmt.Sprintf("%s/api/v1/slot/%d", strings.TrimSuffix(s.cfg.URL, "/"), slot)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	resp, err := s.client.Do(req)
+	resp, err := s.doGet(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch slot: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
@@ -344,16 +372,11 @@ func (s *service) GetSignedBlockHeader(
 
 	url := fmt.Sprintf("%s/slot/0x%x", strings.TrimSuffix(s.cfg.URL, "/"), blockRoot)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	resp, err := s.client.Do(req)
+	resp, err := s.doGet(ctx, url)
 	if err != nil {
 		return nil, fmt.Errorf("failed to fetch slot page: %w", err)
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode == http.StatusNotFound {
 		return nil, nil
@@ -580,12 +603,7 @@ func (s *service) IsValidatorSlashed(
 
 	url := fmt.Sprintf("%s/api/v1/validator/%d", strings.TrimSuffix(s.cfg.URL, "/"), validatorIndex)
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-	if err != nil {
-		return false, fmt.Errorf("failed to create request: %w", err)
-	}
-
-	resp, err := s.client.Do(req)
+	resp, err := s.doGet(ctx, url)
 	if err != nil {
 		return false, fmt.Errorf("failed to fetch validator: %w", err)
 	}
@@ -628,30 +646,25 @@ func (s *service) GetAllDoubleProposals(ctx context.Context) ([]*DoubleProposal,
 		url := fmt.Sprintf("%s/api/v1/slots?with_orphaned=2&limit=100&page=%d",
 			strings.TrimSuffix(s.cfg.URL, "/"), page)
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
-		if err != nil {
-			return nil, fmt.Errorf("failed to create request: %w", err)
-		}
-
-		resp, err := s.client.Do(req)
+		resp, err := s.doGet(ctx, url)
 		if err != nil {
 			return nil, fmt.Errorf("failed to fetch orphaned blocks: %w", err)
 		}
 
 		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			return nil, fmt.Errorf("dora API returned status %d", resp.StatusCode)
 		}
 
 		var slotsResp slotsResponse
 		if err := json.NewDecoder(resp.Body).Decode(&slotsResp); err != nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 
 			return nil, fmt.Errorf("failed to decode response: %w", err)
 		}
 
-		resp.Body.Close()
+		_ = resp.Body.Close()
 
 		if slotsResp.Data == nil || len(slotsResp.Data.Slots) == 0 {
 			break

@@ -48,10 +48,14 @@ type Service interface {
 	OnCandidate(handler CandidateHandler)
 }
 
-// attestationKey uniquely identifies attestation data for double vote detection.
+// attestationKey buckets attestations for double vote detection. A validator
+// has one committee assignment per epoch, so both halves of an on-chain double
+// vote share the same slot; the committee index is deliberately NOT part of
+// the key: post-Electra data.index no longer identifies the committee (it is
+// 0, and from Gloas on a payload-availability bit), so attestations that
+// differ only in index must still land in the same bucket to be compared.
 type attestationKey struct {
 	slot        phase0.Slot
-	index       phase0.CommitteeIndex
 	targetEpoch phase0.Epoch
 }
 
@@ -71,6 +75,7 @@ type service struct {
 	mu           sync.RWMutex
 	attestations map[attestationKey][]*storedAttestation
 	epochBounds  *EpochBounds
+	maxTarget    phase0.Epoch
 
 	candidateHandlers []CandidateHandler
 	processedCount    uint64
@@ -142,19 +147,46 @@ func (s *service) storeAttestation(att *beacon.Attestation) {
 
 	key := attestationKey{
 		slot:        att.Data.Slot,
-		index:       att.Data.Index,
 		targetEpoch: att.Data.Target.Epoch,
 	}
 
-	stored := &storedAttestation{
+	// Head events and backfill overlap, so the same aggregate can be
+	// processed more than once; storing it again would make every future
+	// conflict report duplicate candidates.
+	for _, stored := range s.attestations[key] {
+		if stored.signature == att.Signature && attestationDataEqual(stored.attestation.Data, att.Data) {
+			return
+		}
+	}
+
+	s.attestations[key] = append(s.attestations[key], &storedAttestation{
 		attestation: att,
 		sourceEpoch: att.Data.Source.Epoch,
 		targetEpoch: att.Data.Target.Epoch,
 		targetRoot:  att.Data.Target.Root,
 		signature:   att.Signature,
+	})
+
+	if att.Data.Target.Epoch > s.maxTarget {
+		s.maxTarget = att.Data.Target.Epoch
+		s.pruneLocked()
+	}
+}
+
+// pruneLocked drops attestations outside the retention window. Callers must
+// hold s.mu.
+func (s *service) pruneLocked() {
+	if s.cfg.MaxEpochsToKeep == 0 || s.maxTarget < phase0.Epoch(s.cfg.MaxEpochsToKeep) {
+		return
 	}
 
-	s.attestations[key] = append(s.attestations[key], stored)
+	cutoff := s.maxTarget - phase0.Epoch(s.cfg.MaxEpochsToKeep)
+
+	for key := range s.attestations {
+		if key.targetEpoch < cutoff {
+			delete(s.attestations, key)
+		}
+	}
 }
 
 func (s *service) checkDoubleVote(att *beacon.Attestation) {
@@ -163,14 +195,16 @@ func (s *service) checkDoubleVote(att *beacon.Attestation) {
 
 	key := attestationKey{
 		slot:        att.Data.Slot,
-		index:       att.Data.Index,
 		targetEpoch: att.Data.Target.Epoch,
 	}
 
-	existing := s.attestations[key]
-
-	for _, stored := range existing {
-		if stored.targetRoot != att.Data.Target.Root && stored.signature != att.Signature {
+	// Two attestations with the same target epoch and ANY difference in their
+	// data are a double vote (is_slashable_attestation_data) — not just a
+	// differing target root: rival head roots or a differing payload bit
+	// (Gloas data.index) conflict too. Same data in different aggregates is
+	// never slashable, however the signatures differ.
+	for _, stored := range s.attestations[key] {
+		if !attestationDataEqual(stored.attestation.Data, att.Data) {
 			s.reportCandidate(&SlashingCandidate{
 				Type:         ViolationDoubleVote,
 				Attestation1: stored.attestation,
@@ -178,6 +212,16 @@ func (s *service) checkDoubleVote(att *beacon.Attestation) {
 			})
 		}
 	}
+}
+
+func attestationDataEqual(a, b *beacon.AttestationData) bool {
+	return a.Slot == b.Slot &&
+		a.Index == b.Index &&
+		a.BeaconBlockRoot == b.BeaconBlockRoot &&
+		a.Source.Epoch == b.Source.Epoch &&
+		a.Source.Root == b.Source.Root &&
+		a.Target.Epoch == b.Target.Epoch &&
+		a.Target.Root == b.Target.Root
 }
 
 func (s *service) checkSurroundViolations(att *beacon.Attestation) {
@@ -215,13 +259,18 @@ func (s *service) checkSurroundedViolations(att *beacon.Attestation) {
 }
 
 func (s *service) reportCandidate(candidate *SlashingCandidate) {
+	// Debug, not Warn: rival aggregates around a reorg produce candidates
+	// constantly; only the detector's validator-overlap check decides whether
+	// one is an actual equivocation worth shouting about.
 	s.log.WithFields(logrus.Fields{
 		"type":    candidate.Type.String(),
+		"slot1":   candidate.Attestation1.Data.Slot,
+		"slot2":   candidate.Attestation2.Data.Slot,
 		"source1": candidate.Attestation1.Data.Source.Epoch,
 		"target1": candidate.Attestation1.Data.Target.Epoch,
 		"source2": candidate.Attestation2.Data.Source.Epoch,
 		"target2": candidate.Attestation2.Data.Target.Epoch,
-	}).Warn("slashing candidate detected")
+	}).Debug("slashing candidate detected")
 
 	handlers := s.candidateHandlers
 

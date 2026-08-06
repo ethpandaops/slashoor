@@ -14,17 +14,26 @@ const (
 // EpochBounds tracks the m(i) and M(i) functions for lazy slasher detection.
 // m(i): minimum target epoch for attestations with source > i
 // M(i): maximum target epoch for attestations with source < i
+//
+// Per-source extrema are stored (one entry per distinct source epoch) and
+// m/M answers are memoized; an update only invalidates the memos when it
+// improves a per-source extremum, which after warm-up is rare. This keeps
+// Update O(1) instead of O(current epoch) per attestation.
 type EpochBounds struct {
-	mu sync.RWMutex
-	m  map[phase0.Epoch]phase0.Epoch
-	mM map[phase0.Epoch]phase0.Epoch
+	mu                sync.Mutex
+	minTargetBySource map[phase0.Epoch]phase0.Epoch
+	maxTargetBySource map[phase0.Epoch]phase0.Epoch
+	minMemo           map[phase0.Epoch]phase0.Epoch
+	maxMemo           map[phase0.Epoch]phase0.Epoch
 }
 
 // NewEpochBounds creates a new epoch bounds tracker.
 func NewEpochBounds() *EpochBounds {
 	return &EpochBounds{
-		m:  make(map[phase0.Epoch]phase0.Epoch, 1024),
-		mM: make(map[phase0.Epoch]phase0.Epoch, 1024),
+		minTargetBySource: make(map[phase0.Epoch]phase0.Epoch, 1024),
+		maxTargetBySource: make(map[phase0.Epoch]phase0.Epoch, 1024),
+		minMemo:           make(map[phase0.Epoch]phase0.Epoch, 64),
+		maxMemo:           make(map[phase0.Epoch]phase0.Epoch, 64),
 	}
 }
 
@@ -33,73 +42,90 @@ func (e *EpochBounds) Update(sourceEpoch, targetEpoch phase0.Epoch) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	for i := phase0.Epoch(0); i < sourceEpoch; i++ {
-		if current, exists := e.m[i]; !exists || targetEpoch < current {
-			e.m[i] = targetEpoch
-		}
+	if current, exists := e.minTargetBySource[sourceEpoch]; !exists || targetEpoch < current {
+		e.minTargetBySource[sourceEpoch] = targetEpoch
+		clear(e.minMemo)
 	}
 
-	for i := sourceEpoch + 1; i <= targetEpoch; i++ {
-		if current, exists := e.mM[i]; !exists || targetEpoch > current {
-			e.mM[i] = targetEpoch
-		}
+	if current, exists := e.maxTargetBySource[sourceEpoch]; !exists || targetEpoch > current {
+		e.maxTargetBySource[sourceEpoch] = targetEpoch
+		clear(e.maxMemo)
 	}
 }
 
 // GetMinTarget returns m(i): minimum target epoch for attestations with source > i.
 func (e *EpochBounds) GetMinTarget(sourceEpoch phase0.Epoch) phase0.Epoch {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	if target, exists := e.m[sourceEpoch]; exists {
+	if target, exists := e.minMemo[sourceEpoch]; exists {
 		return target
 	}
 
-	return maxEpochValue
+	result := maxEpochValue
+
+	for source, target := range e.minTargetBySource {
+		if source > sourceEpoch && target < result {
+			result = target
+		}
+	}
+
+	e.minMemo[sourceEpoch] = result
+
+	return result
 }
 
 // GetMaxTarget returns M(i): maximum target epoch for attestations with source < i.
 func (e *EpochBounds) GetMaxTarget(sourceEpoch phase0.Epoch) phase0.Epoch {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
+	e.mu.Lock()
+	defer e.mu.Unlock()
 
-	if target, exists := e.mM[sourceEpoch]; exists {
+	if target, exists := e.maxMemo[sourceEpoch]; exists {
 		return target
 	}
 
-	return minEpochValue
+	result := minEpochValue
+
+	for source, target := range e.maxTargetBySource {
+		if source < sourceEpoch && target > result {
+			result = target
+		}
+	}
+
+	e.maxMemo[sourceEpoch] = result
+
+	return result
 }
 
 // CheckSurroundVote checks if an attestation (s, t) could have a surround violation.
 // Returns true if t > m(s), meaning there might be a surrounding vote.
 func (e *EpochBounds) CheckSurroundVote(sourceEpoch, targetEpoch phase0.Epoch) bool {
-	minTarget := e.GetMinTarget(sourceEpoch)
-
-	return targetEpoch > minTarget
+	return targetEpoch > e.GetMinTarget(sourceEpoch)
 }
 
 // CheckSurroundedVote checks if an attestation (s, t) could be surrounded.
 // Returns true if t < M(s), meaning there might be an attestation that surrounds this one.
 func (e *EpochBounds) CheckSurroundedVote(sourceEpoch, targetEpoch phase0.Epoch) bool {
-	maxTarget := e.GetMaxTarget(sourceEpoch)
-
-	return targetEpoch < maxTarget
+	return targetEpoch < e.GetMaxTarget(sourceEpoch)
 }
 
-// Prune removes epochs older than the given epoch.
+// Prune removes entries for source epochs older than the given epoch.
 func (e *EpochBounds) Prune(beforeEpoch phase0.Epoch) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 
-	for epoch := range e.m {
+	for epoch := range e.minTargetBySource {
 		if epoch < beforeEpoch {
-			delete(e.m, epoch)
+			delete(e.minTargetBySource, epoch)
 		}
 	}
 
-	for epoch := range e.mM {
+	for epoch := range e.maxTargetBySource {
 		if epoch < beforeEpoch {
-			delete(e.mM, epoch)
+			delete(e.maxTargetBySource, epoch)
 		}
 	}
+
+	clear(e.minMemo)
+	clear(e.maxMemo)
 }

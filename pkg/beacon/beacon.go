@@ -428,15 +428,18 @@ func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
 	return nil, ErrAllNodesFailed
 }
 
-// GetCommittees retrieves beacon committees for a specific slot.
-// The state at the attestation's own slot is tried first: head can only
-// compute committees for slots near its shuffling window, so head-only
-// queries return errors (or nothing) for backfilled historical slots. Head
-// remains the fallback for nodes that have pruned the older state.
+// GetCommittees retrieves beacon committees for the epoch containing a slot.
+// The epoch query against the head state is tried first: every client
+// answers it quickly (success or failure), and head can compute past-epoch
+// committees from its own registry. The state-at-slot form is client
+// lottery — lighthouse/teku 404 for pruned or skipped slots and grandine
+// hangs until the client timeout — so it is only a deep-history fallback.
 func (s *service) GetCommittees(ctx context.Context, slot phase0.Slot) ([]*Committee, error) {
+	epoch := uint64(slot) / s.slotsPerEpoch
+
 	paths := []string{
+		fmt.Sprintf("/eth/v1/beacon/states/head/committees?epoch=%d", epoch),
 		fmt.Sprintf("/eth/v1/beacon/states/%d/committees?slot=%d", slot, slot),
-		fmt.Sprintf("/eth/v1/beacon/states/head/committees?slot=%d", slot),
 	}
 
 	var lastErr error

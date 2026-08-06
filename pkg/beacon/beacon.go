@@ -851,6 +851,8 @@ func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *Attester
 		lastErr      error
 	)
 
+	var rejection string
+
 	for _, n := range s.nodes {
 		resp, err := s.doNodeRequest(ctx, n, "POST", path, body, headers)
 		if err != nil {
@@ -859,21 +861,38 @@ func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *Attester
 			continue
 		}
 
-		_ = resp.Body.Close()
-
 		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
+			_ = resp.Body.Close()
 			successCount++
 
 			s.log.WithField("endpoint", n.display).Debug("submitted slashing to node")
-		} else {
-			s.log.WithFields(logrus.Fields{
-				"endpoint": n.display,
-				"status":   resp.StatusCode,
-			}).Warn("failed to submit slashing")
+
+			continue
 		}
+
+		// Capture why the node refused: a rejected proof is rare and always a
+		// bug in either detection or proof construction, so the reason and the
+		// payload needed to replay it must reach the logs.
+		reason, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+		_ = resp.Body.Close()
+
+		if rejection == "" {
+			rejection = string(reason)
+		}
+
+		s.log.WithFields(logrus.Fields{
+			"endpoint": n.display,
+			"status":   resp.StatusCode,
+			"reason":   string(reason),
+		}).Warn("failed to submit slashing")
 	}
 
 	if successCount == 0 {
+		s.log.WithFields(logrus.Fields{
+			"rejection": rejection,
+			"payload":   string(body),
+		}).Warn("slashing rejected by every node")
+
 		if lastErr != nil {
 			return lastErr
 		}

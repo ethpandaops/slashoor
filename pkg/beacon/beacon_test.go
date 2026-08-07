@@ -2,284 +2,102 @@ package beacon
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func newTestService(t *testing.T, endpoints ...string) *service {
+func newTestService(t *testing.T, handler http.HandlerFunc) *service {
 	t.Helper()
-
-	if len(endpoints) == 0 {
-		endpoints = []string{"http://localhost:5052"}
-	}
-
-	log := logrus.New()
-	log.SetLevel(logrus.PanicLevel)
-
-	svc := New(&Config{Endpoints: endpoints, Timeout: 5 * time.Second}, log)
-
-	s, ok := svc.(*service)
-	if !ok {
-		t.Fatal("New did not return *service")
-	}
-
-	return s
+	srv := httptest.NewServer(handler)
+	t.Cleanup(srv.Close)
+	cfg := &Config{Endpoints: []string{srv.URL}, Timeout: 5 * time.Second, HealthCheckInterval: time.Minute}
+	return New(cfg, logrus.New()).(*service)
 }
 
-func TestCommitteeIndicesFromBits(t *testing.T) {
-	tests := []struct {
-		name string
-		bits []byte
-		want []phase0.CommitteeIndex
-	}{
-		{name: "empty", bits: nil, want: []phase0.CommitteeIndex{}},
-		{name: "single committee zero", bits: []byte{0x01}, want: []phase0.CommitteeIndex{0}},
-		{name: "committees 0 and 2", bits: []byte{0x05}, want: []phase0.CommitteeIndex{0, 2}},
-		{name: "cross byte boundary", bits: []byte{0x80, 0x01}, want: []phase0.CommitteeIndex{7, 8}},
-		{name: "full first byte", bits: []byte{0xff}, want: []phase0.CommitteeIndex{0, 1, 2, 3, 4, 5, 6, 7}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := committeeIndicesFromBits(tt.bits)
-
-			if len(got) != len(tt.want) {
-				t.Fatalf("got %v, want %v", got, tt.want)
-			}
-
-			for i := range got {
-				if got[i] != tt.want[i] {
-					t.Fatalf("got %v, want %v", got, tt.want)
-				}
-			}
-		})
-	}
+func TestParseRoot(t *testing.T) {
+	r := parseRoot("0x0102030000000000000000000000000000000000000000000000000000000000")
+	assert.Equal(t, byte(0x01), r[0])
+	assert.Equal(t, byte(0x02), r[1])
+	assert.Equal(t, byte(0x03), r[2])
 }
 
-func TestResolveElectraValidators(t *testing.T) {
-	s := newTestService(t)
-
-	slot := phase0.Slot(100)
-
-	// Committee 1 has validators 10,11,12; committee 3 has 20,21.
-	s.cacheCommittee(&Committee{Index: 1, Slot: slot, Validators: []phase0.ValidatorIndex{10, 11, 12}})
-	s.cacheCommittee(&Committee{Index: 3, Slot: slot, Validators: []phase0.ValidatorIndex{20, 21}})
-
-	// aggregation_bits concatenates committee 1 (3 bits) then committee 3
-	// (2 bits): set bits 0, 2 (validators 10, 12) and bit 4 (validator 21),
-	// plus the SSZ bitlist delimiter at bit 5.
-	att := &Attestation{
-		AggregationBits: []byte{0b00110101},
-		CommitteeBits:   []byte{0b00001010},
-		Data:            &AttestationData{Slot: slot, Index: 0},
-		Version:         "electra",
-	}
-
-	got, err := s.ResolveAttestingValidators(context.Background(), att)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	want := []phase0.ValidatorIndex{10, 12, 21}
-	if len(got) != len(want) {
-		t.Fatalf("got %v, want %v", got, want)
-	}
-
-	for i := range got {
-		if got[i] != want[i] {
-			t.Fatalf("got %v, want %v", got, want)
-		}
-	}
+func TestRedactCredentials(t *testing.T) {
+	assert.Equal(t, "http://***@node:5052", redact("http://user:pass@node:5052"))
+	assert.Equal(t, "http://node:5052", redact("http://node:5052"))
 }
 
-func TestResolveElectraValidatorsBitsTooShort(t *testing.T) {
-	s := newTestService(t)
-
-	slot := phase0.Slot(100)
-	s.cacheCommittee(&Committee{Index: 0, Slot: slot, Validators: make([]phase0.ValidatorIndex, 20)})
-
-	att := &Attestation{
-		AggregationBits: []byte{0xff}, // 8 bits for a 20-validator committee
-		CommitteeBits:   []byte{0x01},
-		Data:            &AttestationData{Slot: slot},
-	}
-
-	if _, err := s.ResolveAttestingValidators(context.Background(), att); err == nil {
-		t.Fatal("expected error for truncated aggregation bits")
-	}
+func TestSpec(t *testing.T) {
+	s := newTestService(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/eth/v1/config/spec", r.URL.Path)
+		_, _ = w.Write([]byte(`{"data":{"SLOTS_PER_EPOCH":"32","ELECTRA_FORK_EPOCH":"100"}}`))
+	})
+	spec, err := s.Spec(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "32", spec["SLOTS_PER_EPOCH"])
+	assert.Equal(t, "100", spec["ELECTRA_FORK_EPOCH"])
 }
 
-func TestResolvePhase0Validators(t *testing.T) {
-	s := newTestService(t)
-
-	slot := phase0.Slot(50)
-	s.cacheCommittee(&Committee{Index: 2, Slot: slot, Validators: []phase0.ValidatorIndex{7, 5, 9}})
-
-	att := &Attestation{
-		AggregationBits: []byte{0b00000101},
-		Data:            &AttestationData{Slot: slot, Index: 2},
-	}
-
-	got, err := s.ResolveAttestingValidators(context.Background(), att)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-
-	// Committee members 7 and 9 attest; result must be sorted ascending.
-	want := []phase0.ValidatorIndex{7, 9}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("got %v, want %v", got, want)
-	}
+func TestCommittees(t *testing.T) {
+	s := newTestService(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, "/eth/v1/beacon/states/head/committees", r.URL.Path)
+		assert.Equal(t, "5", r.URL.Query().Get("epoch"))
+		_, _ = w.Write([]byte(`{"data":[
+			{"index":"0","slot":"160","validators":["1","2","3"]},
+			{"index":"1","slot":"160","validators":["4","5"]}
+		]}`))
+	})
+	committees, err := s.Committees(context.Background(), 5)
+	require.NoError(t, err)
+	require.Contains(t, committees, phase0.Slot(160))
+	require.Len(t, committees[160], 2)
+	assert.Equal(t, []phase0.ValidatorIndex{1, 2, 3}, committees[160][0])
+	assert.Equal(t, []phase0.ValidatorIndex{4, 5}, committees[160][1])
 }
 
-func TestRedactEndpoint(t *testing.T) {
-	tests := []struct {
-		in   string
-		want string
-	}{
-		{in: "https://eth:secret@bn-node.example.com", want: "https://bn-node.example.com"},
-		{in: "https://bn-node.example.com", want: "https://bn-node.example.com"},
-		{in: "http://user@localhost:5052", want: "http://localhost:5052"},
-	}
-
-	for _, tt := range tests {
-		if got := redactEndpoint(tt.in); got != tt.want {
-			t.Fatalf("redactEndpoint(%q) = %q, want %q", tt.in, got, tt.want)
-		}
-	}
+func TestValidatorsStatus(t *testing.T) {
+	s := newTestService(t, func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodPost, r.Method)
+		_, _ = w.Write([]byte(`{"data":[
+			{"index":"7","status":"active_ongoing","validator":{"slashed":true,"activation_epoch":"0","exit_epoch":"18446744073709551615","withdrawable_epoch":"18446744073709551615"}}
+		]}`))
+	})
+	got, err := s.ValidatorsStatus(context.Background(), []phase0.ValidatorIndex{7})
+	require.NoError(t, err)
+	require.Contains(t, got, phase0.ValidatorIndex(7))
+	assert.True(t, got[7].Slashed)
+	assert.Equal(t, "active_ongoing", got[7].Status)
 }
 
-func TestForkVersionOrdering(t *testing.T) {
-	if NewerForkVersion("electra", "phase0") != "electra" {
-		t.Fatal("electra should rank above phase0")
-	}
-
-	if NewerForkVersion("electra", "gloas") != "gloas" {
-		t.Fatal("gloas should rank above electra")
-	}
-
-	// Unknown future forks rank newest.
-	if NewerForkVersion("electra", "heze") != "heze" {
-		t.Fatal("unknown fork should rank above electra")
-	}
-
-	if forkRank("deneb") >= forkRank("electra") {
-		t.Fatal("deneb should rank below electra")
-	}
+func TestBlockByRootNotFound(t *testing.T) {
+	s := newTestService(t, func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	})
+	blk, err := s.BlockByRoot(context.Background(), phase0.Root{0x01})
+	require.NoError(t, err)
+	assert.Nil(t, blk, "missing block yields (nil, nil)")
 }
 
-func TestParseAttestationCommitteeBits(t *testing.T) {
-	s := newTestService(t)
+func TestFailoverMarksUnhealthy(t *testing.T) {
+	// One always-erroring endpoint plus a good one: reads still succeed.
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"data":{"SLOTS_PER_EPOCH":"32"}}`))
+	}))
+	t.Cleanup(good.Close)
 
-	raw := json.RawMessage(`{
-		"aggregation_bits": "0x0103",
-		"committee_bits": "0x0500000000000000",
-		"data": {
-			"slot": "123",
-			"index": "0",
-			"beacon_block_root": "0x` + repeat64("aa") + `",
-			"source": {"epoch": "3", "root": "0x` + repeat64("bb") + `"},
-			"target": {"epoch": "4", "root": "0x` + repeat64("cc") + `"}
-		},
-		"signature": "0x` + repeat192("dd") + `"
-	}`)
-
-	att, err := s.parseAttestation(raw, "electra")
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
+	cfg := &Config{
+		Endpoints:           []string{"http://127.0.0.1:0", good.URL},
+		Timeout:             time.Second,
+		HealthCheckInterval: time.Minute,
 	}
-
-	if att.Version != "electra" {
-		t.Fatalf("version = %q, want electra", att.Version)
-	}
-
-	if len(att.CommitteeBits) != 8 || att.CommitteeBits[0] != 0x05 {
-		t.Fatalf("committee bits = %x, want 05 followed by zeros", att.CommitteeBits)
-	}
-
-	if att.Data.Slot != 123 || att.Data.Source.Epoch != 3 || att.Data.Target.Epoch != 4 {
-		t.Fatalf("unexpected attestation data: %+v", att.Data)
-	}
-}
-
-func TestSubmitAttesterSlashingEndpointSelection(t *testing.T) {
-	tests := []struct {
-		name        string
-		version     string
-		wantPath    string
-		wantVersion string
-	}{
-		{name: "electra uses v2", version: "electra", wantPath: "/eth/v2/beacon/pool/attester_slashings", wantVersion: "electra"},
-		{name: "gloas uses v2", version: "gloas", wantPath: "/eth/v2/beacon/pool/attester_slashings", wantVersion: "gloas"},
-		{name: "empty defaults to electra v2", version: "", wantPath: "/eth/v2/beacon/pool/attester_slashings", wantVersion: "electra"},
-		{name: "phase0 uses v1", version: "phase0", wantPath: "/eth/v1/beacon/pool/attester_slashings", wantVersion: ""},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			var gotPath, gotVersion string
-
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				gotPath = r.URL.Path
-				gotVersion = r.Header.Get("Eth-Consensus-Version")
-				w.WriteHeader(http.StatusOK)
-			}))
-			defer server.Close()
-
-			s := newTestService(t, server.URL)
-
-			slashing := &AttesterSlashing{
-				Attestation1: testIndexedAttestation(),
-				Attestation2: testIndexedAttestation(),
-				Version:      tt.version,
-			}
-
-			if err := s.SubmitAttesterSlashing(context.Background(), slashing); err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-
-			if gotPath != tt.wantPath {
-				t.Fatalf("path = %q, want %q", gotPath, tt.wantPath)
-			}
-
-			if gotVersion != tt.wantVersion {
-				t.Fatalf("Eth-Consensus-Version = %q, want %q", gotVersion, tt.wantVersion)
-			}
-		})
-	}
-}
-
-func testIndexedAttestation() *IndexedAttestation {
-	return &IndexedAttestation{
-		AttestingIndices: []phase0.ValidatorIndex{1, 2, 3},
-		Data: &AttestationData{
-			Slot:   100,
-			Source: &Checkpoint{Epoch: 2},
-			Target: &Checkpoint{Epoch: 3},
-		},
-	}
-}
-
-func repeat64(hexByte string) string {
-	out := ""
-	for range 32 {
-		out += hexByte
-	}
-
-	return out
-}
-
-func repeat192(hexByte string) string {
-	out := ""
-	for range 96 {
-		out += hexByte
-	}
-
-	return out
+	s := New(cfg, logrus.New()).(*service)
+	spec, err := s.Spec(context.Background())
+	require.NoError(t, err)
+	assert.Equal(t, "32", spec["SLOTS_PER_EPOCH"])
 }

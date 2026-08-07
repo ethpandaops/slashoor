@@ -1,169 +1,88 @@
 # Slashoor
 
-A slasher implementation for detecting and submitting attester and proposer slashings on the Ethereum beacon chain.
+A production Ethereum beacon-chain slasher: it detects and submits attester
+slashings (double and surround votes) and proposer slashings (double proposals),
+for both live and historic offenses.
 
-## Overview
+Slashoor uses the same chunked min/max-target detection algorithm as Lighthouse
+and Prysm, but offloads durable storage of full attestations to a
+[Dora](https://github.com/ethpandaops/dora) explorer — keeping the local index
+roughly an order of magnitude smaller. See [`docs/design.md`](docs/design.md)
+for the full design.
 
-Slashoor detects two types of slashable offenses:
+## What it detects
 
-### Attester Slashings
+**Attester slashings** (`is_slashable_attestation_data`):
 
-Uses the lazy slasher algorithm with two global functions instead of per-validator databases:
+- **Double vote** — two attestations by the same validator with the same target
+  epoch but different data.
+- **Surround vote** — one attestation surrounds another (`source_1 < source_2`
+  and `target_2 < target_1`), and the reverse (surrounded).
 
-- `m(i)`: minimum target epoch for attestations with source > i
-- `M(i)`: maximum target epoch for attestations with source < i
+**Proposer slashings** — two distinct blocks by the same validator for the same
+slot.
 
-This approach efficiently detects surround votes by checking if `t > m(s)` for any attestation `(s, t)`.
+## How it works
 
-### Proposer Slashings
+- **Detection**: per-validator min/max target arrays, tiled into
+  16-epoch × 256-validator compressed chunks in a local [Pebble](https://github.com/cockroachdb/pebble)
+  database, giving O(1) surround checks over a sliding window (default 4096
+  epochs ≈ 18 days). Double votes and evidence locators use compact per-epoch
+  attester records. Only locators are stored locally — never full attestations.
+- **Ingestion**: blocks come from Dora (canonical *and* orphaned, historic) and
+  from beacon-node SSE (live). Each attestation is expanded to its validator
+  indices via committees resolved from Dora duties (historic) or the beacon node
+  (recent), including EIP-7549 multi-committee aggregates.
+- **Evidence**: on a hit, both attestations are re-fetched, the slashable
+  condition re-verified against the spec, the attester sets expanded, and the
+  fork-correct `AttesterSlashing` built. Evidence is classified `submittable` vs
+  `report-only` (already-slashed intersection, or predating the previous fork so
+  BLS domains can no longer verify it).
+- **Submission**: fork-aware (`/eth/v2/beacon/pool/attester_slashings` with the
+  consensus-version header, v1 for proposer slashings), broadcast to all healthy
+  nodes, deduplicated against a persistent marker set.
 
-Detects double proposals where the same validator proposes two different blocks for the same slot:
-- **Real-time detection**: Monitors incoming blocks via SSE subscription
-- **Historical detection**: Scans Dora explorer for orphaned blocks and compares with canonical blocks
+## Start modes
 
-## Slashing Violations Detected
+Configured via `start.mode`:
 
-### Attester Violations
-1. **Double Vote**: Same validator attests to different block roots for the same target epoch
-2. **Surround Vote**: Attestation `(s, t)` surrounds `(s', t')` if `s < s'` AND `t' < t`
+- `head` — follow the current head; no historic scan.
+- `genesis` — scan forward from genesis, then follow head.
+- `slot` — scan forward from `start.slot`, then follow head.
 
-### Proposer Violations
-3. **Double Proposal**: Same validator proposes two different blocks for the same slot
+The scan resumes from a persisted cursor after a restart. To move the start
+point earlier or rebuild, pass `--reset-to-slot N` (0 = genesis), which wipes the
+index and rescans.
 
-## Features
-
-- **Multi-node support**: Connect to multiple beacon nodes for redundancy
-- **Automatic failover**: API requests failover to healthy nodes
-- **Parallel SSE subscriptions**: Subscribe to attestations from all nodes simultaneously
-- **Deduplication**: Automatic deduplication of attestations from multiple sources
-- **Health tracking**: Nodes are marked unhealthy on failures and retried
-- **Dora integration**: Scans Dora explorer for historical double proposals from genesis
-- **Validator status checking**: Skips already-slashed validators
-- **Header fallback**: Falls back to Dora web scraping when beacon nodes have pruned orphaned blocks
-
-## Installation
-
-### From Source
+## Install
 
 ```bash
 go build -o slashoor .
 ```
 
-### Docker
-
-```bash
-docker build -t slashoor .
-```
-
 ## Usage
-
-### Configuration
-
-Create a `config.yaml` file:
-
-```yaml
-beacon:
-  endpoints:
-    - "http://localhost:5052"
-    - "http://localhost:5053"
-    - "http://beacon-node-1:5052"
-  timeout: 30s
-
-indexer:
-  max_epochs_to_keep: 54000
-
-detector:
-  enabled: true
-
-proposer:
-  enabled: true
-
-submitter:
-  enabled: true
-  dry_run: false
-
-dora:
-  enabled: true
-  url: "https://dora.your-network.ethpandaops.io"
-  scan_on_startup: true
-
-backfill_slots: 0
-```
-
-### Running
 
 ```bash
 ./slashoor --config config.yaml --log-level info
 ```
 
-### Docker
+See [`config.example.yaml`](config.example.yaml) for all options. Dora must be
+enabled (with its blockdb configured) for historic scans and orphaned-block
+coverage; without it, slashoor runs on beacon-node data only (live/recent,
+canonical-only).
 
-```bash
-docker run -v $(pwd)/config.yaml:/app/config.yaml slashoor --config /app/config.yaml
-```
+## Dora dependency
 
-## Configuration Options
+Slashoor relies on a few general-purpose Dora API endpoints (branch
+`pk910/slashoor-api`):
 
-| Option | Description | Default |
-|--------|-------------|---------|
-| `beacon.endpoints` | List of beacon node API URLs | `["http://localhost:5052"]` |
-| `beacon.timeout` | HTTP request timeout | `30s` |
-| `indexer.max_epochs_to_keep` | Maximum epochs to retain in memory | `54000` |
-| `detector.enabled` | Enable attester slashing detection | `true` |
-| `proposer.enabled` | Enable proposer slashing detection | `true` |
-| `submitter.enabled` | Enable slashing submission | `true` |
-| `submitter.dry_run` | Log slashings without submitting | `false` |
-| `dora.enabled` | Enable Dora explorer integration | `false` |
-| `dora.url` | Dora explorer URL | `""` |
-| `dora.scan_on_startup` | Scan for historical double proposals on startup | `true` |
-| `backfill_slots` | Number of slots to backfill attestations on startup | `0` |
+- `GET /api/v1/epoch/{epoch}/duties` and `GET /api/v1/slot/{slot}/committees` —
+  attester committees as global validator indices.
+- `POST /api/v1/validators/status` — bulk validator status (plus `slashed` and
+  `withdrawable_epoch` on `/api/v1/validators`).
 
-## Architecture
-
-```
-                         ┌──────────────┐
-                         │ Beacon Node 1│───┐
-                         └──────────────┘   │
-                         ┌──────────────┐   │    ┌─────────────┐
-                         │ Beacon Node 2│───┼───▶│   Beacon    │
-                         └──────────────┘   │    │   Service   │
-                         ┌──────────────┐   │    │ (failover + │
-                         │ Beacon Node N│───┘    │   dedup)    │
-                         └──────────────┘        └──────┬──────┘
-                                                        │
-              ┌──────────────┐                          │
-              │     Dora     │──────────────────────────┤
-              │   Explorer   │                          │
-              └──────────────┘                          ▼
-                                                ┌─────────────┐
-┌─────────────┐     ┌─────────────┐     ┌──────▶│  Submitter  │
-│   Indexer   │◀────│ Coordinator │─────┤       │  (submit)   │
-│ (m/M algo)  │     │             │     │       └─────────────┘
-└──────┬──────┘     └─────────────┘     │
-       │                   │            │
-       ▼                   ▼            │
-┌─────────────┐     ┌─────────────┐     │
-│  Detector   │────▶│  Proposer   │─────┘
-│ (attester)  │     │  (proposer) │
-└─────────────┘     └─────────────┘
-```
-
-## Multi-Node Behavior
-
-- **API Requests**: Tried against healthy nodes first, with automatic failover on failure
-- **SSE Subscriptions**: All nodes subscribed in parallel for maximum attestation coverage
-- **Slashing Submission**: Submitted to all configured nodes for redundancy
-- **Health Tracking**: Failed nodes marked unhealthy and retried after 5 seconds
-
-## Dora Integration
-
-When Dora is enabled, slashoor can:
-
-1. **Scan historical double proposals**: On startup, fetches all orphaned blocks from Dora and compares each with its canonical counterpart to detect double proposals
-2. **Fetch signed headers**: When beacon nodes have pruned orphaned blocks, falls back to scraping Dora's web interface to get signed block headers with signatures
-3. **Check validator status**: Skips validators that are already slashed to avoid redundant submissions
-
-The Dora integration uses page-based pagination to fetch all orphaned blocks from genesis, ensuring no slashable offense is missed.
+Full block bodies (canonical and orphaned) are fetched via Dora's existing
+block-download route.
 
 ## License
 

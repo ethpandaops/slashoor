@@ -1,133 +1,74 @@
 package detector
 
 import (
-	"context"
 	"testing"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
-	"github.com/sirupsen/logrus"
-
-	"github.com/slashoor/slashoor/pkg/beacon"
-	"github.com/slashoor/slashoor/pkg/indexer"
+	"github.com/ethpandaops/go-eth2-client/spec/all"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
+	"github.com/ethpandaops/go-eth2-client/spec/version"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// stubBeacon implements beacon.Service, resolving attesting validators from a
-// fixed map keyed by the attestation's first signature byte.
-type stubBeacon struct {
-	beacon.Service
-	validatorsBySig map[byte][]phase0.ValidatorIndex
-}
-
-func (s *stubBeacon) ResolveAttestingValidators(
-	_ context.Context,
-	att *beacon.Attestation,
-) ([]phase0.ValidatorIndex, error) {
-	return s.validatorsBySig[att.Signature[0]], nil
-}
-
-func makeCandidate(version1, version2 string) *indexer.SlashingCandidate {
-	att := func(sigByte byte, version string) *beacon.Attestation {
-		var sig phase0.BLSSignature
-
-		sig[0] = sigByte
-
-		return &beacon.Attestation{
-			Data: &beacon.AttestationData{
-				Slot:   100,
-				Source: &beacon.Checkpoint{Epoch: 2},
-				Target: &beacon.Checkpoint{Epoch: 3},
-			},
-			Signature: sig,
-			Version:   version,
-		}
-	}
-
-	return &indexer.SlashingCandidate{
-		Type:         indexer.ViolationDoubleVote,
-		Attestation1: att(0x01, version1),
-		Attestation2: att(0x02, version2),
+func attData(source, target phase0.Epoch, blockRoot byte) *phase0.AttestationData {
+	return &phase0.AttestationData{
+		Slot:            phase0.Slot(target) * 32,
+		Index:           0,
+		BeaconBlockRoot: phase0.Root{blockRoot},
+		Source:          &phase0.Checkpoint{Epoch: source},
+		Target:          &phase0.Checkpoint{Epoch: target},
 	}
 }
 
-func newTestDetector(t *testing.T, stub *stubBeacon) (Service, *[]*beacon.AttesterSlashing) {
-	t.Helper()
-
-	log := logrus.New()
-	log.SetLevel(logrus.PanicLevel)
-
-	svc := New(&Config{Enabled: true}, stub, log)
-
-	slashings := &[]*beacon.AttesterSlashing{}
-
-	svc.OnSlashing(func(sl *beacon.AttesterSlashing) {
-		*slashings = append(*slashings, sl)
-	})
-
-	return svc, slashings
+func att(source, target phase0.Epoch, blockRoot byte) *all.Attestation {
+	return &all.Attestation{Version: version.DataVersionElectra, Data: attData(source, target, blockRoot)}
 }
 
-func TestSlashingCarriesFullAttestingSets(t *testing.T) {
-	stub := &stubBeacon{validatorsBySig: map[byte][]phase0.ValidatorIndex{
-		0x01: {1, 2, 3},
-		0x02: {2, 3, 4, 5},
-	}}
-
-	svc, slashings := newTestDetector(t, stub)
-
-	svc.HandleCandidate(context.Background(), makeCandidate("electra", "electra"))
-
-	if len(*slashings) != 1 {
-		t.Fatalf("got %d slashings, want 1", len(*slashings))
-	}
-
-	sl := (*slashings)[0]
-
-	// Each half must carry its own full attesting set: the aggregate
-	// signature covers every participant, so submitting the intersection
-	// would fail signature verification on the node.
-	if len(sl.Attestation1.AttestingIndices) != 3 {
-		t.Fatalf("attestation1 indices = %v, want full set of 3", sl.Attestation1.AttestingIndices)
-	}
-
-	if len(sl.Attestation2.AttestingIndices) != 4 {
-		t.Fatalf("attestation2 indices = %v, want full set of 4", sl.Attestation2.AttestingIndices)
-	}
-
-	if sl.Version != "electra" {
-		t.Fatalf("version = %q, want electra", sl.Version)
-	}
+func TestOrderSlashablePairDoubleVote(t *testing.T) {
+	a := att(3, 5, 0xaa)
+	b := att(3, 5, 0xbb) // same target, different block root -> double vote
+	a1, a2, ok := orderSlashablePair(a, b)
+	require.True(t, ok)
+	assert.Equal(t, a, a1)
+	assert.Equal(t, b, a2)
 }
 
-func TestNoSlashingWithoutOverlap(t *testing.T) {
-	stub := &stubBeacon{validatorsBySig: map[byte][]phase0.ValidatorIndex{
-		0x01: {1, 2},
-		0x02: {3, 4},
-	}}
-
-	svc, slashings := newTestDetector(t, stub)
-
-	svc.HandleCandidate(context.Background(), makeCandidate("electra", "electra"))
-
-	if len(*slashings) != 0 {
-		t.Fatalf("got %d slashings, want 0 for disjoint validator sets", len(*slashings))
-	}
+func TestOrderSlashablePairSurround(t *testing.T) {
+	inner := att(4, 5, 0x01)
+	outer := att(3, 6, 0x02) // outer surrounds inner
+	// Pass in reversed order; ordering must put the surrounder first.
+	a1, a2, ok := orderSlashablePair(inner, outer)
+	require.True(t, ok)
+	assert.Equal(t, outer, a1, "surrounder is attestation_1")
+	assert.Equal(t, inner, a2)
 }
 
-func TestSlashingVersionUsesNewerFork(t *testing.T) {
-	stub := &stubBeacon{validatorsBySig: map[byte][]phase0.ValidatorIndex{
-		0x01: {1},
-		0x02: {1},
-	}}
+func TestOrderSlashablePairNotSlashable(t *testing.T) {
+	a := att(3, 5, 0x01)
+	b := att(6, 8, 0x02) // disjoint, not slashable
+	_, _, ok := orderSlashablePair(a, b)
+	assert.False(t, ok)
+}
 
-	svc, slashings := newTestDetector(t, stub)
+func TestIntersect(t *testing.T) {
+	a := []phase0.ValidatorIndex{1, 3, 5, 7, 9}
+	b := []phase0.ValidatorIndex{2, 3, 5, 8, 9}
+	assert.Equal(t, []phase0.ValidatorIndex{3, 5, 9}, intersect(a, b))
+	assert.Empty(t, intersect([]phase0.ValidatorIndex{1, 2}, []phase0.ValidatorIndex{3, 4}))
+}
 
-	svc.HandleCandidate(context.Background(), makeCandidate("electra", "gloas"))
+func TestOffenseIDOrderIndependent(t *testing.T) {
+	d1 := attData(3, 5, 0xaa)
+	d2 := attData(3, 5, 0xbb)
+	assert.Equal(t, attesterOffenseID(d1, d2), attesterOffenseID(d2, d1))
 
-	if len(*slashings) != 1 {
-		t.Fatalf("got %d slashings, want 1", len(*slashings))
-	}
+	r1 := phase0.Root{0x11}
+	r2 := phase0.Root{0x22}
+	assert.Equal(t, proposerOffenseID(r1, r2), proposerOffenseID(r2, r1))
+	assert.NotEqual(t, attesterOffenseID(d1, d2), proposerOffenseID(r1, r2))
+}
 
-	if (*slashings)[0].Version != "gloas" {
-		t.Fatalf("version = %q, want gloas", (*slashings)[0].Version)
-	}
+func TestNewerVersion(t *testing.T) {
+	assert.Equal(t, version.DataVersionElectra, newerVersion(version.DataVersionDeneb, version.DataVersionElectra))
+	assert.Equal(t, version.DataVersionElectra, newerVersion(version.DataVersionElectra, version.DataVersionDeneb))
 }

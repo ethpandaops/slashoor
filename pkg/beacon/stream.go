@@ -3,139 +3,184 @@ package beacon
 import (
 	"bufio"
 	"context"
-	"fmt"
+	"encoding/json"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	"github.com/sirupsen/logrus"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 )
 
-// Stream handles SSE connections to the beacon node.
-type Stream struct {
-	endpoint string
-	log      logrus.FieldLogger
-	client   *http.Client
-	mu       sync.Mutex
-	closed   bool
-	cancel   context.CancelFunc
-}
-
-// NewStream creates a new SSE stream handler.
-func NewStream(endpoint string, log logrus.FieldLogger) *Stream {
-	return &Stream{
-		endpoint: endpoint,
-		log:      log.WithField("component", "stream"),
-		client:   &http.Client{},
+// SubscribeToBlocks subscribes to block SSE events on every node and invokes
+// handler once per distinct block (deduplicated across nodes). It returns
+// immediately; delivery runs until the service is stopped.
+func (s *service) SubscribeToBlocks(ctx context.Context, handler func(BlockEvent)) {
+	dedup := newEventDedup()
+	for _, n := range s.nodes {
+		s.wg.Add(1)
+		go func(n *node) {
+			defer s.wg.Done()
+			s.streamTopic(ctx, n, "block", func(data []byte) {
+				var ev struct {
+					Slot  string `json:"slot"`
+					Block string `json:"block"`
+				}
+				if err := json.Unmarshal(data, &ev); err != nil {
+					return
+				}
+				root := parseRoot(ev.Block)
+				if dedup.seen(root) {
+					return
+				}
+				handler(BlockEvent{Slot: phase0.Slot(parseUint(ev.Slot)), Block: root})
+			})
+		}(n)
 	}
 }
 
-// Subscribe subscribes to an SSE event topic. This method blocks until the
-// context is cancelled or an unrecoverable error occurs.
-func (s *Stream) Subscribe(ctx context.Context, topic string, handler func([]byte)) error {
-	ctx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
+// SubscribeToHeads subscribes to head SSE events on every node.
+func (s *service) SubscribeToHeads(ctx context.Context, handler func(HeadEvent)) {
+	dedup := newEventDedup()
+	for _, n := range s.nodes {
+		s.wg.Add(1)
+		go func(n *node) {
+			defer s.wg.Done()
+			s.streamTopic(ctx, n, "head", func(data []byte) {
+				var ev struct {
+					Slot  string `json:"slot"`
+					Block string `json:"block"`
+				}
+				if err := json.Unmarshal(data, &ev); err != nil {
+					return
+				}
+				root := parseRoot(ev.Block)
+				if dedup.seen(root) {
+					return
+				}
+				handler(HeadEvent{Slot: phase0.Slot(parseUint(ev.Slot)), Block: root})
+			})
+		}(n)
+	}
+}
 
-	url := fmt.Sprintf("%s/eth/v1/events?topics=%s", s.endpoint, topic)
-
+// streamTopic maintains an SSE connection to one node's topic, reconnecting on
+// error until the context is cancelled.
+func (s *service) streamTopic(ctx context.Context, n *node, topic string, onData func([]byte)) {
+	url := n.url + "/eth/v1/events?topics=" + topic
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return
 		default:
 		}
-
-		req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-		if err != nil {
-			return fmt.Errorf("failed to create SSE request: %w", err)
-		}
-
-		req.Header.Set("Accept", "text/event-stream")
-		req.Header.Set("Cache-Control", "no-cache")
-		req.Header.Set("Connection", "keep-alive")
-
-		if err := s.connectAndRead(ctx, req, handler); err != nil {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-
-			s.log.WithError(err).Warn("SSE connection error, reconnecting")
-
+		if err := s.readSSE(ctx, url, onData); err != nil && ctx.Err() == nil {
+			s.log.WithField("endpoint", redact(n.url)).WithField("topic", topic).
+				WithError(err).Debug("SSE reconnecting")
 			select {
 			case <-ctx.Done():
-				return ctx.Err()
+				return
 			case <-time.After(5 * time.Second):
-				continue
 			}
 		}
 	}
 }
 
-// Close closes the SSE stream.
-func (s *Stream) Close() {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.closed {
-		return
-	}
-
-	s.closed = true
-
-	if s.cancel != nil {
-		s.cancel()
-	}
-}
-
-func (s *Stream) connectAndRead(
-	ctx context.Context,
-	req *http.Request,
-	handler func([]byte),
-) error {
-	resp, err := s.client.Do(req)
+func (s *service) readSSE(ctx context.Context, url string, onData func([]byte)) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
-		return fmt.Errorf("failed to connect to SSE: %w", err)
+		return err
+	}
+	req.Header.Set("Accept", "text/event-stream")
+	// SSE is a long-lived stream: use a client without the per-request timeout.
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
 	}
 	defer func() { _ = resp.Body.Close() }()
-
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
+		return errStatus(resp.StatusCode)
 	}
-
-	s.log.Info("connected to SSE stream")
 
 	scanner := bufio.NewScanner(resp.Body)
-	var eventData strings.Builder
-
+	scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+	var data strings.Builder
 	for scanner.Scan() {
-		select {
-		case <-ctx.Done():
+		if ctx.Err() != nil {
 			return ctx.Err()
-		default:
 		}
-
 		line := scanner.Text()
-
 		if line == "" {
-			if eventData.Len() > 0 {
-				handler([]byte(eventData.String()))
-				eventData.Reset()
+			if data.Len() > 0 {
+				onData([]byte(data.String()))
+				data.Reset()
 			}
-
 			continue
 		}
-
-		if strings.HasPrefix(line, "data:") {
-			data := strings.TrimPrefix(line, "data:")
-			data = strings.TrimSpace(data)
-			eventData.WriteString(data)
+		if v, ok := strings.CutPrefix(line, "data:"); ok {
+			data.WriteString(strings.TrimSpace(v))
 		}
 	}
+	return scanner.Err()
+}
 
-	if err := scanner.Err(); err != nil {
-		return fmt.Errorf("scanner error: %w", err)
+type statusError int
+
+func (e statusError) Error() string { return "unexpected SSE status" }
+
+func errStatus(code int) error { return statusError(code) }
+
+func parseRoot(s string) phase0.Root {
+	var r phase0.Root
+	s = strings.TrimPrefix(s, "0x")
+	for i := 0; i < len(r) && i*2+1 < len(s); i++ {
+		r[i] = hexByte(s[i*2])<<4 | hexByte(s[i*2+1])
 	}
+	return r
+}
 
-	return nil
+func hexByte(c byte) byte {
+	switch {
+	case c >= '0' && c <= '9':
+		return c - '0'
+	case c >= 'a' && c <= 'f':
+		return c - 'a' + 10
+	case c >= 'A' && c <= 'F':
+		return c - 'A' + 10
+	default:
+		return 0
+	}
+}
+
+// eventDedup drops repeated events (same block root) seen across multiple nodes
+// within a short window.
+type eventDedup struct {
+	mu    sync.Mutex
+	seen1 map[phase0.Root]time.Time
+	last  time.Time
+}
+
+func newEventDedup() *eventDedup {
+	return &eventDedup{seen1: make(map[phase0.Root]time.Time)}
+}
+
+func (d *eventDedup) seen(root phase0.Root) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	now := time.Now()
+	if _, ok := d.seen1[root]; ok {
+		return true
+	}
+	d.seen1[root] = now
+	// Opportunistic cleanup of entries older than two minutes.
+	if now.Sub(d.last) > time.Minute {
+		for k, ts := range d.seen1 {
+			if now.Sub(ts) > 2*time.Minute {
+				delete(d.seen1, k)
+			}
+		}
+		d.last = now
+	}
+	return false
 }

@@ -1,502 +1,400 @@
+// Package coordinator wires the slasher together and drives its lifecycle: it
+// fetches the chain spec, opens the index, runs the historic backfill sweep
+// (via Dora) and the live head follower (via SSE), and routes detection
+// candidates through evidence building to submission.
 package coordinator
 
 import (
 	"context"
 	"fmt"
+	"os"
 	"sync"
+	"sync/atomic"
+	"time"
 
-	"github.com/attestantio/go-eth2-client/spec/phase0"
+	"github.com/ethpandaops/go-eth2-client/spec/all"
+	"github.com/ethpandaops/go-eth2-client/spec/phase0"
 	"github.com/sirupsen/logrus"
 
-	"github.com/slashoor/slashoor/pkg/beacon"
-	"github.com/slashoor/slashoor/pkg/detector"
-	"github.com/slashoor/slashoor/pkg/dora"
-	"github.com/slashoor/slashoor/pkg/indexer"
-	"github.com/slashoor/slashoor/pkg/proposer"
-	"github.com/slashoor/slashoor/pkg/submitter"
+	"github.com/ethpandaops/slashoor/pkg/beacon"
+	"github.com/ethpandaops/slashoor/pkg/chainspec"
+	"github.com/ethpandaops/slashoor/pkg/detector"
+	"github.com/ethpandaops/slashoor/pkg/dora"
+	"github.com/ethpandaops/slashoor/pkg/duties"
+	"github.com/ethpandaops/slashoor/pkg/indexer"
+	"github.com/ethpandaops/slashoor/pkg/ingest"
+	"github.com/ethpandaops/slashoor/pkg/submitter"
 )
 
-// Service defines the interface for the coordinator.
-type Service interface {
-	Start(ctx context.Context) error
-	Stop() error
-}
-
-type service struct {
+// Coordinator owns and drives all services.
+type Coordinator struct {
 	cfg *Config
 	log logrus.FieldLogger
 
-	beacon    beacon.Service
-	indexer   indexer.Service
-	detector  detector.Service
-	proposer  proposer.Service
-	submitter submitter.Service
-	dora      dora.Service
+	beacon beacon.Service
+	dora   dora.Client // nil when disabled
 
-	wg     sync.WaitGroup
+	spec      *chainspec.Spec
+	store     *indexer.Store
+	duties    *duties.Resolver
+	ingest    *ingest.Extractor
+	detect    *indexer.Detector
+	evidence  *detector.Service
+	submitter submitter.Service
+
 	ctx    context.Context
 	cancel context.CancelFunc
+	wg     sync.WaitGroup
+
+	// frontier is the highest epoch processed so far, driving the detection
+	// window and pruning.
+	frontier   atomic.Uint64
+	lastPruned phase0.Epoch
+	procMu     sync.Mutex // serializes block processing
 }
 
-// New creates a new coordinator service.
-func New(cfg *Config, log logrus.FieldLogger) (Service, error) {
+// New builds a coordinator from configuration.
+func New(cfg *Config, log logrus.FieldLogger) (*Coordinator, error) {
 	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("invalid config: %w", err)
+		return nil, err
 	}
-
-	coordLog := log.WithField("package", "coordinator")
-
-	beaconSvc := beacon.New(cfg.Beacon, log)
-	indexerSvc := indexer.New(cfg.Indexer, log)
-	detectorSvc := detector.New(cfg.Detector, beaconSvc, log)
-	proposerSvc := proposer.New(cfg.Proposer, beaconSvc, log)
-	submitterSvc := submitter.New(cfg.Submitter, beaconSvc, log)
-	doraSvc := dora.New(cfg.Dora, log)
-
-	return &service{
-		cfg:       cfg,
-		log:       coordLog,
-		beacon:    beaconSvc,
-		indexer:   indexerSvc,
-		detector:  detectorSvc,
-		proposer:  proposerSvc,
-		submitter: submitterSvc,
-		dora:      doraSvc,
-	}, nil
+	c := &Coordinator{
+		cfg:    cfg,
+		log:    log.WithField("package", "coordinator"),
+		beacon: beacon.New(cfg.Beacon, log),
+	}
+	if cfg.Dora.Enabled {
+		c.dora = dora.New(cfg.Dora, log)
+	}
+	return c, nil
 }
 
-// Start initializes and starts all services.
-func (s *service) Start(ctx context.Context) error {
-	s.ctx, s.cancel = context.WithCancel(ctx)
+// Start brings up every service and launches backfill and live following.
+func (c *Coordinator) Start(ctx context.Context) error {
+	c.ctx, c.cancel = context.WithCancel(ctx)
 
-	if err := s.beacon.Start(s.ctx); err != nil {
-		return fmt.Errorf("failed to start beacon service: %w", err)
+	if err := c.beacon.Start(c.ctx); err != nil {
+		return fmt.Errorf("start beacon: %w", err)
 	}
 
-	if err := s.indexer.Start(s.ctx); err != nil {
-		return fmt.Errorf("failed to start indexer service: %w", err)
-	}
-
-	if err := s.detector.Start(s.ctx); err != nil {
-		return fmt.Errorf("failed to start detector service: %w", err)
-	}
-
-	if err := s.proposer.Start(s.ctx); err != nil {
-		return fmt.Errorf("failed to start proposer service: %w", err)
-	}
-
-	if err := s.submitter.Start(s.ctx); err != nil {
-		return fmt.Errorf("failed to start submitter service: %w", err)
-	}
-
-	if err := s.dora.Start(s.ctx); err != nil {
-		return fmt.Errorf("failed to start dora service: %w", err)
-	}
-
-	s.wireServices()
-
-	if err := s.backfillAttestations(); err != nil {
-		s.log.WithError(err).Warn("failed to backfill attestations")
-	}
-
-	if err := s.scanDoraHistorical(); err != nil {
-		s.log.WithError(err).Warn("failed to scan dora for historical proposer slashings")
-	}
-
-	if err := s.subscribeToHeads(); err != nil {
-		return fmt.Errorf("failed to subscribe to heads: %w", err)
-	}
-
-	if err := s.subscribeToBlocks(); err != nil {
-		return fmt.Errorf("failed to subscribe to blocks: %w", err)
-	}
-
-	s.log.Info("coordinator started")
-
-	return nil
-}
-
-// Stop shuts down all services.
-func (s *service) Stop() error {
-	s.log.Info("stopping coordinator")
-
-	if s.cancel != nil {
-		s.cancel()
-	}
-
-	s.wg.Wait()
-
-	var errs []error
-
-	if err := s.submitter.Stop(); err != nil {
-		errs = append(errs, fmt.Errorf("submitter: %w", err))
-	}
-
-	if err := s.detector.Stop(); err != nil {
-		errs = append(errs, fmt.Errorf("detector: %w", err))
-	}
-
-	if err := s.proposer.Stop(); err != nil {
-		errs = append(errs, fmt.Errorf("proposer: %w", err))
-	}
-
-	if err := s.indexer.Stop(); err != nil {
-		errs = append(errs, fmt.Errorf("indexer: %w", err))
-	}
-
-	if err := s.beacon.Stop(); err != nil {
-		errs = append(errs, fmt.Errorf("beacon: %w", err))
-	}
-
-	if err := s.dora.Stop(); err != nil {
-		errs = append(errs, fmt.Errorf("dora: %w", err))
-	}
-
-	if len(errs) > 0 {
-		return fmt.Errorf("errors during shutdown: %v", errs)
-	}
-
-	s.log.Info("coordinator stopped")
-
-	return nil
-}
-
-func (s *service) wireServices() {
-	s.indexer.OnCandidate(func(candidate *indexer.SlashingCandidate) {
-		s.detector.HandleCandidate(s.ctx, candidate)
-	})
-
-	s.detector.OnSlashing(func(slashing *beacon.AttesterSlashing) {
-		s.submitter.SubmitAttesterSlashing(slashing)
-	})
-
-	s.proposer.OnSlashing(func(slashing *beacon.ProposerSlashing) {
-		s.submitter.SubmitProposerSlashing(slashing)
-	})
-}
-
-func (s *service) subscribeToHeads() error {
-	s.wg.Add(1)
-
-	go func() {
-		defer s.wg.Done()
-
-		if err := s.beacon.SubscribeToHeads(s.ctx, s.handleHead); err != nil {
-			if s.ctx.Err() == nil {
-				s.log.WithError(err).Error("head subscription failed")
-			}
-		}
-	}()
-
-	return nil
-}
-
-func (s *service) subscribeToBlocks() error {
-	s.wg.Add(1)
-
-	go func() {
-		defer s.wg.Done()
-
-		if err := s.beacon.SubscribeToBlocks(s.ctx, s.handleBlock); err != nil {
-			if s.ctx.Err() == nil {
-				s.log.WithError(err).Error("block subscription failed")
-			}
-		}
-	}()
-
-	return nil
-}
-
-func (s *service) handleBlock(event *beacon.BlockEvent) {
-	// SSE block events don't include proposer_index, fetch it from header
-	if event.ProposerIndex == 0 {
-		header, err := s.beacon.GetSignedBlockHeader(s.ctx, event.Block)
-		if err != nil {
-			s.log.WithError(err).WithField("block", fmt.Sprintf("0x%x", event.Block[:8])).
-				Debug("failed to get block header")
-
-			return
-		}
-
-		if header != nil {
-			event.ProposerIndex = header.Message.ProposerIndex
-		}
-	}
-
-	s.log.WithFields(logrus.Fields{
-		"slot":     event.Slot,
-		"proposer": event.ProposerIndex,
-		"block":    fmt.Sprintf("0x%x", event.Block[:8]),
-	}).Debug("new block received")
-
-	s.proposer.HandleBlock(s.ctx, event)
-}
-
-func (s *service) handleHead(event *beacon.HeadEvent) {
-	s.log.WithField("slot", event.Slot).Debug("new head received")
-
-	attestations, err := s.beacon.GetBlockAttestations(s.ctx, event.Slot)
+	spec, err := c.loadSpec(c.ctx)
 	if err != nil {
-		s.log.WithError(err).WithField("slot", event.Slot).Warn("failed to get block attestations")
+		return fmt.Errorf("load chain spec: %w", err)
+	}
+	c.spec = spec
+	if c.dora != nil {
+		c.dora.SetSpec(spec)
+	}
+	c.log.WithFields(logrus.Fields{
+		"slots_per_epoch": spec.SlotsPerEpoch(),
+		"forks":           len(spec.Forks()),
+	}).Info("chain spec loaded")
 
+	if err := c.openStore(c.ctx); err != nil {
+		return err
+	}
+
+	c.duties = duties.New(c.beacon, c.dora, spec, c.log)
+	c.ingest = ingest.New(spec, c.duties, c.log)
+	c.detect = indexer.NewDetector(c.store.Config(), c.log)
+	c.evidence = detector.New(&detector.Config{Enabled: c.cfg.Detection.Attester}, spec, c.beacon, c.dora, c.duties, c.store, c.log)
+	c.submitter = submitter.New(c.cfg.Submitter, c.beacon, c.store, c.log)
+	if err := c.submitter.Start(c.ctx); err != nil {
+		return fmt.Errorf("start submitter: %w", err)
+	}
+
+	c.wg.Add(1)
+	go c.run()
+	return nil
+}
+
+// Stop tears everything down.
+func (c *Coordinator) Stop() error {
+	if c.cancel != nil {
+		c.cancel()
+	}
+	c.wg.Wait()
+	_ = c.submitter.Stop()
+	_ = c.beacon.Stop()
+	if c.store != nil {
+		if err := c.store.Close(); err != nil {
+			return err
+		}
+	}
+	stats := c.submitter.Stats()
+	c.log.WithFields(logrus.Fields{
+		"submitted":   stats.Submitted,
+		"dry_run":     stats.DryRun,
+		"report_only": stats.ReportOnly,
+		"duplicates":  stats.Duplicates,
+		"failed":      stats.Failed,
+	}).Info("slashoor stopped")
+	return nil
+}
+
+// loadSpec fetches and parses the chain spec, retrying until the context ends.
+func (c *Coordinator) loadSpec(ctx context.Context) (*chainspec.Spec, error) {
+	for {
+		raw, err := c.beacon.Spec(ctx)
+		if err == nil {
+			return chainspec.New(raw)
+		}
+		c.log.WithError(err).Warn("waiting for a beacon node to fetch the spec")
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(5 * time.Second):
+		}
+	}
+}
+
+// run performs backfill (if configured) then live following.
+func (c *Coordinator) run() {
+	defer c.wg.Done()
+
+	c.wg.Add(1)
+	go c.pruneLoop()
+
+	cursor, err := c.store.Cursor()
+	if err != nil {
+		c.log.WithError(err).Error("read cursor")
 		return
 	}
 
-	s.log.WithFields(logrus.Fields{
-		"slot":         event.Slot,
-		"attestations": len(attestations),
-	}).Debug("processing block attestations")
-
-	for _, att := range attestations {
-		s.indexer.ProcessAttestation(att)
+	if !cursor.BackfillComplete {
+		if err := c.backfill(cursor); err != nil {
+			if c.ctx.Err() != nil {
+				return
+			}
+			c.log.WithError(err).Error("backfill failed")
+		}
 	}
+
+	c.follow()
 }
 
-func (s *service) backfillAttestations() error {
-	finality, err := s.beacon.GetFinality(s.ctx)
+// openStore opens (or, on reset, recreates) the index and reconciles the stored
+// cursor with the configured start mode.
+func (c *Coordinator) openStore(ctx context.Context) error {
+	if c.cfg.ResetEnabled {
+		c.log.WithField("dir", c.cfg.DataDir).Warn("resetting index (data will be wiped)")
+		if err := os.RemoveAll(c.cfg.DataDir); err != nil {
+			return fmt.Errorf("reset index: %w", err)
+		}
+	}
+
+	store, err := indexer.Open(c.cfg.DataDir, c.cfg.Indexer, c.log)
 	if err != nil {
-		return fmt.Errorf("failed to get finality: %w", err)
+		return fmt.Errorf("open index (a config change may require --reset-to-slot): %w", err)
 	}
+	c.store = store
 
-	var startSlot, endSlot uint64
+	desiredStart, mode := c.desiredStart(ctx)
 
-	if s.cfg.StartSlotEnabled {
-		startSlot = s.cfg.StartSlot
-		endSlot = uint64(finality.HeadSlot)
-	} else if s.cfg.BackfillSlots > 0 {
-		endSlot = uint64(finality.HeadSlot)
-
-		if endSlot > s.cfg.BackfillSlots {
-			startSlot = endSlot - s.cfg.BackfillSlots
-		}
-	} else {
-		return nil
+	cursor, err := store.Cursor()
+	if err != nil {
+		return err
 	}
-
-	if startSlot >= endSlot {
-		return nil
+	if cursor == nil {
+		cursor = c.newCursor(desiredStart, mode)
+		if err := store.SetCursor(cursor); err != nil {
+			return err
+		}
+	} else if !c.cfg.ResetEnabled && uint64(desiredStart) < cursor.StartSlot {
+		return fmt.Errorf(
+			"configured start slot %d is earlier than the stored start %d; detection state would be incomplete. Pass --reset-to-slot %d to rebuild",
+			desiredStart, cursor.StartSlot, desiredStart)
 	}
-
-	totalSlots := endSlot - startSlot
-	s.log.WithFields(logrus.Fields{
-		"start_slot":  startSlot,
-		"end_slot":    endSlot,
-		"total_slots": totalSlots,
-	}).Info("backfilling attestations")
-
-	var (
-		totalAttestations uint64
-		processedSlots    uint64
-	)
-
-	for slot := startSlot; slot <= endSlot; slot++ {
-		if s.ctx.Err() != nil {
-			return s.ctx.Err()
-		}
-
-		attestations, err := s.beacon.GetBlockAttestations(s.ctx, phase0.Slot(slot))
-		if err != nil {
-			s.log.WithError(err).WithField("slot", slot).Debug("failed to get block attestations")
-
-			continue
-		}
-
-		for _, att := range attestations {
-			s.indexer.ProcessAttestation(att)
-			totalAttestations++
-		}
-
-		processedSlots++
-
-		if processedSlots%100 == 0 {
-			s.log.WithFields(logrus.Fields{
-				"slot":               slot,
-				"progress":           fmt.Sprintf("%.1f%%", float64(processedSlots)/float64(totalSlots)*100),
-				"total_attestations": totalAttestations,
-			}).Info("backfill progress")
-		}
+	c.frontier.Store(uint64(c.spec.EpochOfSlot(phase0.Slot(cursor.StartSlot))))
+	if cursor.ProcessedSlot >= 0 {
+		c.frontier.Store(uint64(c.spec.EpochOfSlot(phase0.Slot(cursor.ProcessedSlot))))
 	}
-
-	s.log.WithFields(logrus.Fields{
-		"slots_processed":    processedSlots,
-		"total_attestations": totalAttestations,
-	}).Info("backfill complete")
-
 	return nil
 }
 
-func (s *service) scanDoraHistorical() error {
-	if !s.cfg.Dora.Enabled || !s.cfg.Dora.ScanOnStartup {
-		return nil
+// desiredStart resolves the configured start slot, honoring a reset override.
+func (c *Coordinator) desiredStart(ctx context.Context) (phase0.Slot, string) {
+	if c.cfg.ResetEnabled {
+		if c.cfg.ResetToSlot <= 0 {
+			return 0, string(StartGenesis)
+		}
+		return phase0.Slot(c.cfg.ResetToSlot), string(StartSlot)
 	}
+	switch c.cfg.Start.Mode {
+	case StartGenesis:
+		return 0, string(StartGenesis)
+	case StartSlot:
+		return phase0.Slot(c.cfg.Start.Slot), string(StartSlot)
+	default: // head
+		return c.headSlot(ctx), string(StartHead)
+	}
+}
 
-	s.log.Info("scanning dora for all historical double-proposals")
+// newCursor builds a fresh cursor for a start slot/mode.
+func (c *Coordinator) newCursor(startSlot phase0.Slot, mode string) *indexer.Cursor {
+	cursor := &indexer.Cursor{Mode: mode, StartSlot: uint64(startSlot), ProcessedSlot: -1}
+	if mode == string(StartHead) {
+		// No historic scan: begin live at head.
+		cursor.ProcessedSlot = int64(startSlot)
+		cursor.BackfillComplete = true
+	} else if startSlot > 0 {
+		cursor.ProcessedSlot = int64(startSlot) - 1
+	}
+	c.log.WithFields(logrus.Fields{"mode": mode, "start_slot": startSlot}).Info("initialized index cursor")
+	return cursor
+}
 
-	// Get all double-proposals by checking each orphaned block against its canonical counterpart
-	doubleProposals, err := s.dora.GetAllDoubleProposals(s.ctx)
+func (c *Coordinator) headSlot(ctx context.Context) phase0.Slot {
+	fin, err := c.beacon.Finality(ctx)
 	if err != nil {
-		return fmt.Errorf("failed to get double proposals: %w", err)
+		c.log.WithError(err).Warn("could not fetch head slot")
+		return 0
+	}
+	return fin.HeadSlot
+}
+
+// pendingBlock is a block awaiting indexing, with its (canonical or orphaned)
+// root.
+type pendingBlock struct {
+	block *all.SignedBeaconBlock
+	root  phase0.Root
+}
+
+// attCandidate / propCandidate carry a detected candidate plus the head epoch at
+// detection time (for submittability classification).
+type attCandidate struct {
+	cand indexer.SlashingCandidate
+	head phase0.Epoch
+}
+
+type propCandidate struct {
+	cand indexer.ProposerCandidate
+	head phase0.Epoch
+}
+
+// indexBlocks runs detection for a batch of blocks in a single index
+// transaction, so every dirtied min/max chunk is flushed once for the whole
+// batch rather than once per block. This is what makes backfill write-efficient
+// (consecutive blocks in an epoch-chunk would otherwise rewrite the same 8 KB
+// chunk repeatedly). Evidence building and submission run afterward, outside the
+// processing lock, since they perform network I/O. sync controls whether the
+// commit is fsync'd (true for live, false for bulk backfill).
+func (c *Coordinator) indexBlocks(items []pendingBlock, sync bool) {
+	if len(items) == 0 {
+		return
 	}
 
-	if len(doubleProposals) == 0 {
-		s.log.Info("no double-proposals found in dora")
+	c.procMu.Lock()
+	txn := c.store.NewTxn()
+	var attHits []attCandidate
+	var propHits []propCandidate
 
-		return nil
-	}
-
-	s.log.WithField("double_proposals", len(doubleProposals)).
-		Info("found double-proposals to process")
-
-	var (
-		slashingsCreated uint64
-		skippedSlashed   uint64
-	)
-
-	for _, dp := range doubleProposals {
-		if s.ctx.Err() != nil {
-			return s.ctx.Err()
-		}
-
-		// Check if validator is already slashed
-		isSlashed, err := s.dora.IsValidatorSlashed(s.ctx, dp.ProposerIndex)
+	for _, it := range items {
+		res, err := c.ingest.Block(c.ctx, it.block, it.root)
 		if err != nil {
-			s.log.WithError(err).WithField("proposer_index", dp.ProposerIndex).
-				Debug("failed to check validator slashed status")
-		}
-
-		if isSlashed {
-			s.log.WithFields(logrus.Fields{
-				"slot":           dp.Slot,
-				"proposer_index": dp.ProposerIndex,
-			}).Debug("validator already slashed, skipping")
-
-			skippedSlashed++
-
+			c.log.WithError(err).Warn("ingest block")
 			continue
 		}
 
-		s.log.WithFields(logrus.Fields{
-			"slot":           dp.Slot,
-			"proposer_index": dp.ProposerIndex,
-			"canonical_root": fmt.Sprintf("0x%x", dp.CanonicalRoot[:8]),
-			"orphaned_root":  fmt.Sprintf("0x%x", dp.OrphanedRoot[:8]),
-		}).Info("processing double-proposal")
-
-		// Create slashing proof
-		slashing, err := s.createProposerSlashingFromDoubleProposal(dp)
-		if err != nil {
-			s.log.WithError(err).WithFields(logrus.Fields{
-				"slot":           dp.Slot,
-				"proposer_index": dp.ProposerIndex,
-			}).Warn("failed to create proposer slashing from double-proposal")
-
-			continue
+		// Keep the local slashed mirror current from on-chain slashings.
+		if len(res.Slashed) > 0 {
+			if err := c.store.MarkSlashed(res.Slashed...); err != nil {
+				c.log.WithError(err).Warn("mark slashed")
+			}
 		}
 
-		if slashing != nil {
-			slashingsCreated++
+		epoch := c.spec.EpochOfSlot(res.Proposal.Slot)
+		if uint64(epoch) > c.frontier.Load() {
+			c.frontier.Store(uint64(epoch))
+		}
+		// Detection uses the global frontier (chain head), not this block's epoch,
+		// so the window floor and max-target fill stay consistent when out-of-order
+		// (reconciled or orphaned) blocks are processed.
+		frontier := phase0.Epoch(c.frontier.Load())
 
-			s.submitter.SubmitProposerSlashing(slashing)
+		if c.cfg.Detection.Attester {
+			cands, err := c.detect.ProcessAttestations(txn, res.Votes, frontier)
+			if err != nil {
+				c.log.WithError(err).Error("process attestations")
+				continue
+			}
+			for _, cand := range cands {
+				attHits = append(attHits, attCandidate{cand, frontier})
+			}
+		}
+		if c.cfg.Detection.Proposer {
+			cand, err := c.detect.ProcessProposal(txn, res.Proposal)
+			if err != nil {
+				c.log.WithError(err).Error("process proposal")
+				continue
+			}
+			if cand != nil {
+				propHits = append(propHits, propCandidate{*cand, frontier})
+			}
 		}
 	}
 
-	s.log.WithFields(logrus.Fields{
-		"slashings_created": slashingsCreated,
-		"skipped_slashed":   skippedSlashed,
-	}).Info("dora historical scan complete")
+	if err := txn.Commit(sync); err != nil {
+		c.log.WithError(err).Error("commit index batch")
+		txn.Close()
+		c.procMu.Unlock()
+		return
+	}
+	txn.Close()
+	c.procMu.Unlock()
 
-	return nil
+	// Evidence building and submission (network I/O) run without the lock.
+	for _, h := range attHits {
+		c.handleAttesterCandidate(h.cand, h.head)
+	}
+	for _, h := range propHits {
+		c.handleProposerCandidate(h.cand, h.head)
+	}
 }
 
-func (s *service) createProposerSlashingFromDoubleProposal(
-	dp *dora.DoubleProposal,
-) (*beacon.ProposerSlashing, error) {
-	// Fetch signed headers for both blocks (canonical and orphaned)
-	header1, err := s.getSignedHeaderWithFallback(dp.CanonicalRoot, dp.Slot)
+func (c *Coordinator) handleAttesterCandidate(cand indexer.SlashingCandidate, headEpoch phase0.Epoch) {
+	ev, err := c.evidence.BuildAttester(c.ctx, cand, headEpoch)
 	if err != nil {
-		return nil, fmt.Errorf("failed to get canonical header 0x%x: %w", dp.CanonicalRoot[:8], err)
+		c.log.WithError(err).Warn("build attester evidence")
+		return
 	}
-
-	if header1 == nil {
-		s.log.WithFields(logrus.Fields{
-			"slot":       dp.Slot,
-			"block_root": fmt.Sprintf("0x%x", dp.CanonicalRoot[:8]),
-		}).Debug("canonical header not available")
-
-		return nil, nil
+	if ev == nil {
+		return
 	}
-
-	header2, err := s.getSignedHeaderWithFallback(dp.OrphanedRoot, dp.Slot)
-	if err != nil {
-		return nil, fmt.Errorf("failed to get orphaned header 0x%x: %w", dp.OrphanedRoot[:8], err)
+	c.log.WithFields(logrus.Fields{
+		"type":        cand.Type.String(),
+		"validator":   cand.Validator,
+		"submittable": ev.Submittable,
+		"offenders":   len(ev.Offenders),
+		"op1_slot":    cand.Att1.Slot,
+		"op1_block":   fmt.Sprintf("0x%x", cand.Att1.BlockRoot),
+		"op1_attidx":  cand.Att1.AttIndex,
+		"op2_slot":    cand.Att2.Slot,
+		"op2_block":   fmt.Sprintf("0x%x", cand.Att2.BlockRoot),
+		"op2_attidx":  cand.Att2.AttIndex,
+	}).Warn("attester slashing detected")
+	if err := c.submitter.SubmitAttester(c.ctx, ev); err != nil {
+		c.log.WithError(err).Error("submit attester slashing")
 	}
-
-	if header2 == nil {
-		s.log.WithFields(logrus.Fields{
-			"slot":       dp.Slot,
-			"block_root": fmt.Sprintf("0x%x", dp.OrphanedRoot[:8]),
-		}).Debug("orphaned header not available")
-
-		return nil, nil
-	}
-
-	// Verify headers are from the same proposer
-	if header1.Message.ProposerIndex != header2.Message.ProposerIndex {
-		s.log.WithFields(logrus.Fields{
-			"slot":             dp.Slot,
-			"header1_proposer": header1.Message.ProposerIndex,
-			"header2_proposer": header2.Message.ProposerIndex,
-		}).Warn("proposer mismatch in headers - not a valid slashing")
-
-		return nil, nil
-	}
-
-	s.log.WithFields(logrus.Fields{
-		"slot":           dp.Slot,
-		"proposer_index": header1.Message.ProposerIndex,
-		"canonical":      fmt.Sprintf("0x%x", dp.CanonicalRoot[:8]),
-		"orphaned":       fmt.Sprintf("0x%x", dp.OrphanedRoot[:8]),
-	}).Info("created proposer slashing proof")
-
-	return &beacon.ProposerSlashing{
-		SignedHeader1: header1,
-		SignedHeader2: header2,
-	}, nil
 }
 
-// getSignedHeaderWithFallback tries beacon node first, then falls back to Dora web scraping.
-func (s *service) getSignedHeaderWithFallback(
-	blockRoot phase0.Root,
-	slot phase0.Slot,
-) (*beacon.SignedBeaconBlockHeader, error) {
-	// Try beacon node first
-	header, err := s.beacon.GetSignedBlockHeader(s.ctx, blockRoot)
-	if err == nil && header != nil {
-		s.log.WithFields(logrus.Fields{
-			"slot":       slot,
-			"block_root": fmt.Sprintf("0x%x", blockRoot[:8]),
-		}).Debug("got header from beacon node")
-
-		return header, nil
-	}
-
-	// Fall back to Dora web scraping
-	s.log.WithFields(logrus.Fields{
-		"slot":       slot,
-		"block_root": fmt.Sprintf("0x%x", blockRoot[:8]),
-	}).Debug("beacon node doesn't have header, trying dora")
-
-	header, err = s.dora.GetSignedBlockHeader(s.ctx, blockRoot)
+func (c *Coordinator) handleProposerCandidate(cand indexer.ProposerCandidate, headEpoch phase0.Epoch) {
+	ev, err := c.evidence.BuildProposer(c.ctx, cand, headEpoch)
 	if err != nil {
-		return nil, fmt.Errorf("dora fallback failed: %w", err)
+		c.log.WithError(err).Warn("build proposer evidence")
+		return
 	}
-
-	if header != nil {
-		s.log.WithFields(logrus.Fields{
-			"slot":       slot,
-			"block_root": fmt.Sprintf("0x%x", blockRoot[:8]),
-		}).Debug("got header from dora web interface")
+	if ev == nil {
+		return
 	}
-
-	return header, nil
+	c.log.WithFields(logrus.Fields{
+		"proposer":    cand.ProposerIndex,
+		"slot":        cand.Slot,
+		"submittable": ev.Submittable,
+		"block1":      fmt.Sprintf("0x%x", cand.Root1),
+		"block2":      fmt.Sprintf("0x%x", cand.Root2),
+	}).Warn("proposer slashing detected")
+	if err := c.submitter.SubmitProposer(c.ctx, ev); err != nil {
+		c.log.WithError(err).Error("submit proposer slashing")
+	}
 }

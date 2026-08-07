@@ -1,26 +1,45 @@
+# Directory for the local Pebble detection index.
+data_dir: "./slashoor-db"
+
 beacon:
+  # Reads fail over across these endpoints; submissions broadcast to all healthy.
   endpoints:
     - "http://localhost:5052"
-    - "http://localhost:5053"
-    - "http://beacon-node-1:5052"
   timeout: 30s
+  health_check_interval: 30s
 
+dora:
+  # Dora is the durable block/duty store: it serves full block bodies for
+  # canonical AND orphaned blocks and attester committees for historic epochs.
+  # Required for genesis/historic scans and for orphaned-block coverage.
+  enabled: false
+  url: "https://dora.example.com"
+  # auth_token: "<bearer token>"
+  timeout: 30s
+  max_retries: 5
+
+# Chunked min/max detection parameters. These must stay constant for the life of
+# the index; changing them requires --reset-to-slot. Defaults match Lighthouse
+# and Prysm.
 indexer:
-  max_epochs_to_keep: 54000
+  chunk_size: 16            # epochs per chunk (C)
+  validator_chunk_size: 256 # validators per chunk (K)
+  history_length: 4096      # sliding surround-detection window in epochs (H, <= 65536)
 
-detector:
-  enabled: true
+# Where indexing begins.
+#   head    - follow the current head, no historic scan
+#   genesis - scan forward from genesis, then follow head
+#   slot    - scan forward from `slot`, then follow head
+start:
+  mode: "head"
+  slot: 0
+
+detection:
+  attester: true  # double + surround votes
+  proposer: true  # double proposals
 
 submitter:
   enabled: true
-  dry_run: false
+  dry_run: false  # when true, detected slashings are logged, not submitted
 
-proposer:
-  enabled: true
-
-dora:
-  enabled: false
-  url: "https://dora.example.com"
-  scan_on_startup: true
-
-# backfill_slots: 64
+# backfill_window_slots: 8192  # slots loaded per backfill page

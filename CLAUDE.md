@@ -34,28 +34,41 @@ gofmt -s -w . && go vet ./... && staticcheck ./... && go test -race ./... && go 
 
 ## Project Structure
 
+See `docs/design.md` for the full architecture (spec conditions, the chunked
+min/max detection algorithm, the Pebble index layout, and the Dora dependency).
+
 ```
 slashoor/
 ├── main.go                 # Entry point
 ├── cmd/                    # CLI commands (cobra)
+├── docs/design.md          # Architecture & design reference
 ├── pkg/
-│   ├── beacon/            # Beacon node client (multi-node, failover)
-│   ├── indexer/           # Lazy slasher indexing (m/M algorithm)
-│   ├── detector/          # Attester slashing detection + proof generation
-│   ├── proposer/          # Proposer slashing detection (double proposals)
-│   ├── submitter/         # Slashing submission to beacon nodes
-│   ├── dora/              # Dora explorer integration
-│   └── coordinator/       # Orchestrates all services
+│   ├── chainspec/         # Chain spec: fork schedule, slot/epoch math, dynssz
+│   ├── beacon/            # Beacon node client (multi-node, failover, SSE, submit)
+│   ├── dora/              # Dora client: block download, epoch duties, validator status
+│   ├── duties/            # Committee resolution + EIP-7549 attestation expansion
+│   ├── indexer/           # Pebble index + chunked min/max detection engine
+│   ├── ingest/            # Block -> detection inputs (votes, proposal, on-chain slashings)
+│   ├── detector/          # Evidence builder: re-fetch, verify, classify, build slashings
+│   ├── submitter/         # Fork-aware submission, dedup, dry-run
+│   └── coordinator/       # Orchestrates backfill + live following, wiring, pruning
 ```
+
+The Dora API extensions this project depends on live on the `pk910/slashoor-api`
+branch of the Dora repo (`/api/v1/epoch/{epoch}/duties`,
+`/api/v1/slot/{slot}/committees`, `/api/v1/validators/status`, plus `slashed` /
+`withdrawable_epoch` on `/api/v1/validators`).
 
 ## Configuration
 
-See `config.yaml` for configuration options. Key settings:
+See `config.example.yaml` for configuration options. Key settings:
 
-- `beacon.endpoints` - List of beacon node URLs
-- `dora.enabled` - Enable Dora integration for historical scanning
-- `dora.scan_on_startup` - Scan all orphaned blocks on startup
+- `beacon.endpoints` - Beacon node URLs (read failover, submission broadcast)
+- `dora.enabled` / `dora.url` - Durable block/duty store (needed for historic & orphaned coverage)
+- `indexer.history_length` - Surround-detection window in epochs (default 4096, max 65536)
+- `start.mode` - `head` | `genesis` | `slot` (with `start.slot`)
 - `submitter.dry_run` - Log slashings without submitting
+- `--reset-to-slot N` - Wipe the index and rescan from slot N (0 = genesis)
 
 ## Running
 

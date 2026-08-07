@@ -3,7 +3,7 @@ package main
 import (
 	"os"
 
-	"github.com/slashoor/slashoor/cmd"
+	"github.com/ethpandaops/slashoor/cmd"
 )
 
 func main() {

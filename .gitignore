@@ -30,3 +30,6 @@ config.yml
 # OS files
 .DS_Store
 Thumbs.db
+
+# Temporary files
+temp/

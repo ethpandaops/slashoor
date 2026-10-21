@@ -1,6 +1,6 @@
 module github.com/slashoor/slashoor
 
-go 1.23.0
+go 1.26.10
 
 require (
 	github.com/attestantio/go-eth2-client v0.21.11

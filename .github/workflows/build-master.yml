@@ -7,11 +7,11 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 env:
-  DOCKERHUB_REPO: ethpandaops/slashoor
+  GHCR_REPO: ghcr.io/ethpandaops/slashoor
 
 jobs:
   check:
@@ -105,6 +105,14 @@ jobs:
     name: Build amd64 docker image
     needs: [build-linux-amd64]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      sha-digest: ${{ steps.push.outputs.sha-digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -115,11 +123,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Download binary
         uses: actions/download-artifact@v4
@@ -131,18 +140,32 @@ jobs:
         run: chmod +x bin/slashoor
 
       - name: Build and push amd64 image
+        id: push
         run: |
+          set -o pipefail
           docker build . --file Dockerfile-stub \
-            --tag ${{ env.DOCKERHUB_REPO }}:master-amd64 \
-            --tag ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-amd64 \
+            --tag ${{ env.GHCR_REPO }}:master-amd64 \
+            --tag ${{ env.GHCR_REPO }}:master-${{ steps.vars.outputs.sha_short }}-amd64 \
             --platform=linux/amd64
-          docker push ${{ env.DOCKERHUB_REPO }}:master-amd64
-          docker push ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-amd64
+          docker push ${{ env.GHCR_REPO }}:master-amd64 | tee "$RUNNER_TEMP/push.log"
+          digest=$(grep -oE 'digest: sha256:[a-f0-9]{64}' "$RUNNER_TEMP/push.log" | cut -d' ' -f2)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          docker push ${{ env.GHCR_REPO }}:master-${{ steps.vars.outputs.sha_short }}-amd64 | tee "$RUNNER_TEMP/push.log"
+          digest=$(grep -oE 'digest: sha256:[a-f0-9]{64}' "$RUNNER_TEMP/push.log" | cut -d' ' -f2)
+          echo "sha-digest=${digest}" >> "$GITHUB_OUTPUT"
 
   build-docker-arm64:
     name: Build arm64 docker image
     needs: [build-linux-arm64]
     runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+      sha-digest: ${{ steps.push.outputs.sha-digest }}
     steps:
       - uses: actions/checkout@v4
 
@@ -153,11 +176,12 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Download binary
         uses: actions/download-artifact@v4
@@ -169,18 +193,29 @@ jobs:
         run: chmod +x bin/slashoor
 
       - name: Build and push arm64 image
+        id: push
         run: |
+          set -o pipefail
           docker build . --file Dockerfile-stub \
-            --tag ${{ env.DOCKERHUB_REPO }}:master-arm64 \
-            --tag ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-arm64 \
+            --tag ${{ env.GHCR_REPO }}:master-arm64 \
+            --tag ${{ env.GHCR_REPO }}:master-${{ steps.vars.outputs.sha_short }}-arm64 \
             --platform=linux/arm64
-          docker push ${{ env.DOCKERHUB_REPO }}:master-arm64
-          docker push ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-arm64
+          docker push ${{ env.GHCR_REPO }}:master-arm64 | tee "$RUNNER_TEMP/push.log"
+          digest=$(grep -oE 'digest: sha256:[a-f0-9]{64}' "$RUNNER_TEMP/push.log" | cut -d' ' -f2)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          docker push ${{ env.GHCR_REPO }}:master-${{ steps.vars.outputs.sha_short }}-arm64 | tee "$RUNNER_TEMP/push.log"
+          digest=$(grep -oE 'digest: sha256:[a-f0-9]{64}' "$RUNNER_TEMP/push.log" | cut -d' ' -f2)
+          echo "sha-digest=${digest}" >> "$GITHUB_OUTPUT"
 
   build-multiarch-manifest:
     name: Build multiarch docker manifest
     needs: [build-docker-amd64, build-docker-arm64]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
     steps:
       - uses: actions/checkout@v4
 
@@ -188,28 +223,51 @@ jobs:
         id: vars
         run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
 
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Create and push multiarch manifests
+        id: manifest
+        env:
+          SHA_SHORT: ${{ steps.vars.outputs.sha_short }}
+          AMD64_DIGEST: ${{ needs.build-docker-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.build-docker-arm64.outputs.digest }}
+          AMD64_SHA_DIGEST: ${{ needs.build-docker-amd64.outputs.sha-digest }}
+          ARM64_SHA_DIGEST: ${{ needs.build-docker-arm64.outputs.sha-digest }}
         run: |
+          set -o pipefail
+          PAIRS="master-amd64@${AMD64_DIGEST} master-arm64@${ARM64_DIGEST}"
+          PAIRS="${PAIRS} master-${SHA_SHORT}-amd64@${AMD64_SHA_DIGEST} master-${SHA_SHORT}-arm64@${ARM64_SHA_DIGEST}"
+
           # Create manifest for master-<sha>
-          docker manifest create ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }} \
-            --amend ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-amd64 \
-            --amend ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-arm64
-          docker manifest push ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}
+          docker manifest create ${{ env.GHCR_REPO }}:master-${{ steps.vars.outputs.sha_short }} \
+            --amend "${{ env.GHCR_REPO }}@${AMD64_SHA_DIGEST}" \
+            --amend "${{ env.GHCR_REPO }}@${ARM64_SHA_DIGEST}"
+          DIGEST=$(docker manifest push ${{ env.GHCR_REPO }}:master-${{ steps.vars.outputs.sha_short }} | tail -n1)
+          PAIRS="${PAIRS} master-${SHA_SHORT}@${DIGEST}"
 
           # Create manifest for master
-          docker manifest create ${{ env.DOCKERHUB_REPO }}:master \
-            --amend ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-amd64 \
-            --amend ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-arm64
-          docker manifest push ${{ env.DOCKERHUB_REPO }}:master
+          docker manifest create ${{ env.GHCR_REPO }}:master \
+            --amend "${{ env.GHCR_REPO }}@${AMD64_SHA_DIGEST}" \
+            --amend "${{ env.GHCR_REPO }}@${ARM64_SHA_DIGEST}"
+          DIGEST=$(docker manifest push ${{ env.GHCR_REPO }}:master | tail -n1)
+          PAIRS="${PAIRS} master@${DIGEST}"
 
           # Create manifest for master-latest
-          docker manifest create ${{ env.DOCKERHUB_REPO }}:master-latest \
-            --amend ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-amd64 \
-            --amend ${{ env.DOCKERHUB_REPO }}:master-${{ steps.vars.outputs.sha_short }}-arm64
-          docker manifest push ${{ env.DOCKERHUB_REPO }}:master-latest
+          docker manifest create ${{ env.GHCR_REPO }}:master-latest \
+            --amend "${{ env.GHCR_REPO }}@${AMD64_SHA_DIGEST}" \
+            --amend "${{ env.GHCR_REPO }}@${ARM64_SHA_DIGEST}"
+          DIGEST=$(docker manifest push ${{ env.GHCR_REPO }}:master-latest | tail -n1)
+          PAIRS="${PAIRS} master-latest@${DIGEST}"
+          echo "pairs=${PAIRS}" >> "$GITHUB_OUTPUT"
+
+      - name: Mirror to Docker Hub
+        uses: ethpandaops/actions/mirror-image@738aeadbcdc54f1c9af659d35f8ef29dd5c0fae6
+        with:
+          image: slashoor
+          tags: ${{ steps.manifest.outputs.pairs }}
+          mirror-url: ${{ secrets.IMAGE_MIRROR_URL }}

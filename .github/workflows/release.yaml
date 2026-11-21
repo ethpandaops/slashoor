@@ -105,7 +105,7 @@ jobs:
   build-docker-amd64:
     name: Build amd64 docker image
     needs: [build-linux-amd64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     permissions:
       contents: read
       packages: write
@@ -139,7 +139,7 @@ jobs:
         id: push
         run: |
           set -o pipefail
-          docker build . --file Dockerfile-stub \
+          docker build . --file Dockerfile-stub --provenance=false --sbom=false \
             --tag ${{ env.GHCR_REPO }}:v${{ inputs.version }}-amd64 \
             --platform=linux/amd64
           docker push ${{ env.GHCR_REPO }}:v${{ inputs.version }}-amd64 | tee "$RUNNER_TEMP/push.log"
@@ -183,7 +183,7 @@ jobs:
         id: push
         run: |
           set -o pipefail
-          docker build . --file Dockerfile-stub \
+          docker build . --file Dockerfile-stub --provenance=false --sbom=false \
             --tag ${{ env.GHCR_REPO }}:v${{ inputs.version }}-arm64 \
             --platform=linux/arm64
           docker push ${{ env.GHCR_REPO }}:v${{ inputs.version }}-arm64 | tee "$RUNNER_TEMP/push.log"
@@ -263,7 +263,7 @@ jobs:
 
   create-release:
     name: Create GitHub Release
-    needs: [build-multiarch-manifest]
+    needs: [build-multiarch-manifest, mirror]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

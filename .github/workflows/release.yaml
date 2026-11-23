@@ -9,6 +9,7 @@ on:
 
 env:
   DOCKERHUB_REPO: ethpandaops/slashoor
+  GHCR_REPO: ghcr.io/ethpandaops/slashoor
 
 permissions:
   contents: write
@@ -104,18 +105,26 @@ jobs:
   build-docker-amd64:
     name: Build amd64 docker image
     needs: [build-linux-amd64]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Download binary
         uses: actions/download-artifact@v4
@@ -127,27 +136,39 @@ jobs:
         run: chmod +x bin/slashoor
 
       - name: Build and push amd64 image
+        id: push
         run: |
-          docker build . --file Dockerfile-stub \
-            --tag ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}-amd64 \
+          set -o pipefail
+          docker build . --file Dockerfile-stub --provenance=false --sbom=false \
+            --tag ${{ env.GHCR_REPO }}:v${{ inputs.version }}-amd64 \
             --platform=linux/amd64
-          docker push ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}-amd64
+          docker push ${{ env.GHCR_REPO }}:v${{ inputs.version }}-amd64 | tee "$RUNNER_TEMP/push.log"
+          digest=$(grep -oE 'digest: sha256:[a-f0-9]{64}' "$RUNNER_TEMP/push.log" | cut -d' ' -f2)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
   build-docker-arm64:
     name: Build arm64 docker image
     needs: [build-linux-arm64]
     runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Download binary
         uses: actions/download-artifact@v4
@@ -159,40 +180,90 @@ jobs:
         run: chmod +x bin/slashoor
 
       - name: Build and push arm64 image
+        id: push
         run: |
-          docker build . --file Dockerfile-stub \
-            --tag ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}-arm64 \
+          set -o pipefail
+          docker build . --file Dockerfile-stub --provenance=false --sbom=false \
+            --tag ${{ env.GHCR_REPO }}:v${{ inputs.version }}-arm64 \
             --platform=linux/arm64
-          docker push ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}-arm64
+          docker push ${{ env.GHCR_REPO }}:v${{ inputs.version }}-arm64 | tee "$RUNNER_TEMP/push.log"
+          digest=$(grep -oE 'digest: sha256:[a-f0-9]{64}' "$RUNNER_TEMP/push.log" | cut -d' ' -f2)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
 
   build-multiarch-manifest:
     name: Build multiarch docker manifest
     needs: [build-docker-amd64, build-docker-arm64]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      image: ${{ steps.attest.outputs.image }}
+      digests: ${{ steps.attest.outputs.digests }}
     steps:
-      - name: Login to Docker Hub
+      - name: Login to GHCR
         uses: docker/login-action@v3
         with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
 
       - name: Create and push multiarch manifests
+        id: manifest
+        env:
+          VERSION: v${{ inputs.version }}
+          AMD64_DIGEST: ${{ needs.build-docker-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.build-docker-arm64.outputs.digest }}
         run: |
+          set -o pipefail
+          PAIRS="${VERSION}-amd64@${AMD64_DIGEST} ${VERSION}-arm64@${ARM64_DIGEST}"
+
           # Create manifest for v<version>
-          docker manifest create ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }} \
-            --amend ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}-amd64 \
-            --amend ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}-arm64
-          docker manifest push ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}
+          docker manifest create ${{ env.GHCR_REPO }}:v${{ inputs.version }} \
+            --amend "${{ env.GHCR_REPO }}@${AMD64_DIGEST}" \
+            --amend "${{ env.GHCR_REPO }}@${ARM64_DIGEST}"
+          DIGEST=$(docker manifest push ${{ env.GHCR_REPO }}:v${{ inputs.version }} | tail -n1)
+          PAIRS="${PAIRS} ${VERSION}@${DIGEST}"
 
           # Create manifest for latest
-          docker manifest create ${{ env.DOCKERHUB_REPO }}:latest \
-            --amend ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}-amd64 \
-            --amend ${{ env.DOCKERHUB_REPO }}:v${{ inputs.version }}-arm64
-          docker manifest push ${{ env.DOCKERHUB_REPO }}:latest
+          docker manifest create ${{ env.GHCR_REPO }}:latest \
+            --amend "${{ env.GHCR_REPO }}@${AMD64_DIGEST}" \
+            --amend "${{ env.GHCR_REPO }}@${ARM64_DIGEST}"
+          DIGEST=$(docker manifest push ${{ env.GHCR_REPO }}:latest | tail -n1)
+          PAIRS="${PAIRS} latest@${DIGEST}"
+          echo "pairs=${PAIRS}" >> "$GITHUB_OUTPUT"
+
+      # Attest here and mirror in the next job, so a failed mirror can be
+      # re-run without rebuilding the images.
+      - name: Attest images
+        id: attest
+        uses: ethpandaops/actions/mirror-image@738aeadbcdc54f1c9af659d35f8ef29dd5c0fae6
+        with:
+          image: slashoor
+          tags: ${{ steps.manifest.outputs.pairs }}
+          mirror: "false"
+
+  mirror:
+    name: Mirror to Docker Hub
+    needs: [build-multiarch-manifest]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    steps:
+      - uses: ethpandaops/actions/mirror-image@738aeadbcdc54f1c9af659d35f8ef29dd5c0fae6
+        with:
+          image: ${{ needs.build-multiarch-manifest.outputs.image }}
+          tags: ${{ needs.build-multiarch-manifest.outputs.digests }}
+          attest: "false"
+          mirror-url: ${{ secrets.IMAGE_MIRROR_URL }}
 
   create-release:
     name: Create GitHub Release
-    needs: [build-multiarch-manifest]
+    needs: [build-multiarch-manifest, mirror]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository

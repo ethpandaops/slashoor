@@ -436,7 +436,7 @@ func (s *service) parseSignedHeaderFromHTML(html string) (*beacon.SignedBeaconBl
 			StateRoot:     stateRoot,
 			BodyRoot:      bodyRoot,
 		},
-		Signature: signature,
+		Signature: signature[:],
 	}, nil
 }
 

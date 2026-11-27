@@ -2,6 +2,7 @@ package beacon
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -23,6 +24,13 @@ var (
 	ErrRequestFailed   = errors.New("beacon request failed")
 	ErrInvalidResponse = errors.New("invalid response from beacon node")
 	ErrAllNodesFailed  = errors.New("all beacon nodes failed")
+
+	ErrMissingBlockState  = errors.New("attestation has no block state to resolve committees from")
+	ErrSlashingRejected   = errors.New("slashing rejected by beacon node")
+	ErrPreviouslyRejected = errors.New("slashing was already rejected")
+	ErrAlreadySubmitted   = errors.New("slashing was already submitted")
+	ErrPQAttesterSlashing = errors.New("pq attester slashings need a per-attestation proof")
+	errNotFound           = errors.New("not found")
 )
 
 // AttestationData represents the data of an attestation.
@@ -51,7 +59,10 @@ type Attestation struct {
 	Signature       phase0.BLSSignature
 	// Version is the consensus fork name of the block the attestation was
 	// read from, as reported by the beacon API (e.g. "electra").
-	Version string
+	Version   string
+	BlockRoot phase0.Root
+	StateRoot phase0.Root
+	ServedBy  string
 }
 
 // IndexedAttestation represents an attestation with validator indices.
@@ -59,6 +70,7 @@ type IndexedAttestation struct {
 	AttestingIndices []phase0.ValidatorIndex
 	Data             *AttestationData
 	Signature        phase0.BLSSignature
+	Proof            []byte
 }
 
 // AttesterSlashing represents a slashing proof for double/surround voting.
@@ -73,7 +85,7 @@ type AttesterSlashing struct {
 // forkOrder lists consensus fork names oldest-first. Unknown names rank
 // newest, so future forks keep the Electra-shaped containers and endpoints
 // until this list says otherwise.
-var forkOrder = []string{"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas"}
+var forkOrder = []string{"phase0", "altair", "bellatrix", "capella", "deneb", "electra", "fulu", "gloas", "pq"}
 
 func forkRank(version string) int {
 	for i, name := range forkOrder {
@@ -83,6 +95,11 @@ func forkRank(version string) int {
 	}
 
 	return len(forkOrder)
+}
+
+// IsPQ reports whether a fork name is pq or later.
+func IsPQ(version string) bool {
+	return forkRank(version) >= forkRank("pq")
 }
 
 // NewerForkVersion returns whichever of the two fork names is more recent.
@@ -126,7 +143,7 @@ type BeaconBlockHeader struct {
 // SignedBeaconBlockHeader represents a signed beacon block header.
 type SignedBeaconBlockHeader struct {
 	Message   *BeaconBlockHeader
-	Signature phase0.BLSSignature
+	Signature []byte
 }
 
 // ProposerSlashing represents a proposer slashing proof.
@@ -147,8 +164,8 @@ type Service interface {
 	Start(ctx context.Context) error
 	Stop() error
 	GetFinality(ctx context.Context) (*Finality, error)
-	GetCommittees(ctx context.Context, slot phase0.Slot) ([]*Committee, error)
 	GetBlockAttestations(ctx context.Context, slot phase0.Slot) ([]*Attestation, error)
+	GetBlockAttestationsByRoot(ctx context.Context, blockRoot phase0.Root) ([]*Attestation, error)
 	GetSignedBlockHeader(ctx context.Context, blockRoot phase0.Root) (*SignedBeaconBlockHeader, error)
 	SubmitAttesterSlashing(ctx context.Context, slashing *AttesterSlashing) error
 	SubmitProposerSlashing(ctx context.Context, slashing *ProposerSlashing) error
@@ -186,9 +203,19 @@ func redactEndpoint(endpoint string) string {
 }
 
 type committeeKey struct {
-	slot  phase0.Slot
-	index phase0.CommitteeIndex
+	stateRoot phase0.Root
+	slot      phase0.Slot
+	index     phase0.CommitteeIndex
 }
+
+type submissionOutcome int
+
+const (
+	submissionAccepted submissionOutcome = iota + 1
+	submissionRejected
+)
+
+const maxRememberedSubmissions = 4096
 
 type service struct {
 	cfg   *Config
@@ -197,6 +224,9 @@ type service struct {
 
 	committeeMu    sync.RWMutex
 	committeeCache map[committeeKey][]phase0.ValidatorIndex
+
+	submissionMu sync.Mutex
+	submissions  map[[32]byte]submissionOutcome
 
 	// slotsPerEpoch is read from /eth/v1/config/spec at startup; written only
 	// in Start, before any concurrent readers exist.
@@ -226,6 +256,7 @@ func New(cfg *Config, log logrus.FieldLogger) Service {
 		log:            log.WithField("package", "beacon"),
 		nodes:          nodes,
 		committeeCache: make(map[committeeKey][]phase0.ValidatorIndex, 2048),
+		submissions:    make(map[[32]byte]submissionOutcome, 256),
 		slotsPerEpoch:  32,
 	}
 }
@@ -428,40 +459,51 @@ func (s *service) GetFinality(ctx context.Context) (*Finality, error) {
 	return nil, ErrAllNodesFailed
 }
 
-// GetCommittees retrieves beacon committees for the epoch containing a slot.
-// The epoch query against the head state is tried first: every client
-// answers it quickly (success or failure), and head can compute past-epoch
-// committees from its own registry. The state-at-slot form is client
-// lottery — lighthouse/teku 404 for pruned or skipped slots and grandine
-// hangs until the client timeout — so it is only a deep-history fallback.
-func (s *service) GetCommittees(ctx context.Context, slot phase0.Slot) ([]*Committee, error) {
-	epoch := uint64(slot) / s.slotsPerEpoch
-
-	paths := []string{
-		fmt.Sprintf("/eth/v1/beacon/states/head/committees?epoch=%d", epoch),
-		fmt.Sprintf("/eth/v1/beacon/states/%d/committees?slot=%d", slot, slot),
-	}
+func (s *service) fetchStateCommittees(ctx context.Context, att *Attestation) error {
+	epoch := uint64(att.Data.Slot) / s.slotsPerEpoch
+	path := fmt.Sprintf("/eth/v1/beacon/states/0x%x/committees?epoch=%d", att.StateRoot, epoch)
 
 	var lastErr error
 
-	for _, path := range paths {
-		for _, n := range s.getHealthyNodes() {
-			committees, err := s.getCommitteesFrom(ctx, n, path)
-			if err != nil {
-				lastErr = err
+	for _, n := range s.nodesPreferring(att.ServedBy) {
+		committees, err := s.getCommitteesFrom(ctx, n, path)
+		if err != nil {
+			lastErr = err
 
-				continue
-			}
-
-			return committees, nil
+			continue
 		}
+
+		for _, c := range committees {
+			s.cacheCommittee(att.StateRoot, c)
+		}
+
+		return nil
 	}
 
 	if lastErr != nil {
-		return nil, lastErr
+		return lastErr
 	}
 
-	return nil, ErrAllNodesFailed
+	return ErrAllNodesFailed
+}
+
+func (s *service) nodesPreferring(endpoint string) []*node {
+	healthy := s.getHealthyNodes()
+	ordered := make([]*node, 0, len(healthy))
+
+	for _, n := range healthy {
+		if n.endpoint == endpoint {
+			ordered = append(ordered, n)
+		}
+	}
+
+	for _, n := range healthy {
+		if n.endpoint != endpoint {
+			ordered = append(ordered, n)
+		}
+	}
+
+	return ordered
 }
 
 func (s *service) getCommitteesFrom(
@@ -510,94 +552,83 @@ func (s *service) getCommitteesFrom(
 			validators = append(validators, phase0.ValidatorIndex(vidx))
 		}
 
-		committee := &Committee{
+		committees = append(committees, &Committee{
 			Index:      phase0.CommitteeIndex(idx),
 			Slot:       phase0.Slot(cSlot),
 			Validators: validators,
-		}
-
-		committees = append(committees, committee)
-
-		s.cacheCommittee(committee)
+		})
 	}
 
 	return committees, nil
 }
 
-func (s *service) cacheCommittee(c *Committee) {
+func (s *service) cacheCommittee(stateRoot phase0.Root, c *Committee) {
 	s.committeeMu.Lock()
 	defer s.committeeMu.Unlock()
 
-	key := committeeKey{slot: c.Slot, index: c.Index}
-	s.committeeCache[key] = c.Validators
+	s.committeeCache[committeeKey{stateRoot: stateRoot, slot: c.Slot, index: c.Index}] = c.Validators
 }
 
-func (s *service) getCachedCommittee(
-	slot phase0.Slot,
-	index phase0.CommitteeIndex,
-) []phase0.ValidatorIndex {
+func (s *service) getCachedCommittee(key committeeKey) []phase0.ValidatorIndex {
 	s.committeeMu.RLock()
 	defer s.committeeMu.RUnlock()
 
-	return s.committeeCache[committeeKey{slot: slot, index: index}]
+	return s.committeeCache[key]
 }
 
-// GetBlockAttestations retrieves attestations from a specific block.
+// GetBlockAttestations retrieves the attestations of the block at a slot.
 func (s *service) GetBlockAttestations(
 	ctx context.Context,
 	slot phase0.Slot,
 ) ([]*Attestation, error) {
-	path := fmt.Sprintf("/eth/v2/beacon/blocks/%d/attestations", slot)
+	return s.blockAttestations(ctx, fmt.Sprintf("%d", slot))
+}
 
+// GetBlockAttestationsByRoot retrieves the attestations of a block by root.
+func (s *service) GetBlockAttestationsByRoot(
+	ctx context.Context,
+	blockRoot phase0.Root,
+) ([]*Attestation, error) {
+	return s.blockAttestations(ctx, fmt.Sprintf("0x%x", blockRoot))
+}
+
+func (s *service) blockAttestations(ctx context.Context, blockID string) ([]*Attestation, error) {
 	var (
 		lastErr  error
 		notFound bool
 	)
 
 	for _, n := range s.getHealthyNodes() {
-		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil, nil)
-		if err != nil {
-			lastErr = err
-			s.markNodeUnhealthy(n)
-
-			continue
-		}
-
-		// A single node's 404 is not authoritative: a stuck or pruned node
-		// answering first would silently blind the slasher. The block only
-		// counts as missing once every healthy node says so.
-		if resp.StatusCode == http.StatusNotFound {
-			_ = resp.Body.Close()
-
+		header, err := s.fetchHeader(ctx, n, blockID)
+		if errors.Is(err, errNotFound) {
 			notFound = true
 
 			continue
 		}
 
-		defer func() { _ = resp.Body.Close() }()
-
-		var result struct {
-			Version string            `json:"version"`
-			Data    []json.RawMessage `json:"data"`
-		}
-
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			lastErr = fmt.Errorf("failed to decode attestations response: %w", err)
+		if err != nil {
+			lastErr = err
 
 			continue
 		}
 
-		attestations := make([]*Attestation, 0, len(result.Data))
+		attestations, err := s.attestationsFrom(ctx, n, header.root)
+		if errors.Is(err, errNotFound) {
+			notFound = true
 
-		for _, raw := range result.Data {
-			att, err := s.parseAttestation(raw, result.Version)
-			if err != nil {
-				s.log.WithError(err).Debug("failed to parse attestation")
+			continue
+		}
 
-				continue
-			}
+		if err != nil {
+			lastErr = err
 
-			attestations = append(attestations, att)
+			continue
+		}
+
+		for _, att := range attestations {
+			att.BlockRoot = header.root
+			att.StateRoot = header.signed.Message.StateRoot
+			att.ServedBy = n.endpoint
 		}
 
 		return attestations, nil
@@ -614,70 +645,113 @@ func (s *service) GetBlockAttestations(
 	return nil, ErrAllNodesFailed
 }
 
-// GetSignedBlockHeader retrieves a signed block header by block root.
-func (s *service) GetSignedBlockHeader(
-	ctx context.Context,
-	blockRoot phase0.Root,
-) (*SignedBeaconBlockHeader, error) {
-	path := fmt.Sprintf("/eth/v1/beacon/headers/0x%x", blockRoot)
+func (s *service) attestationsFrom(ctx context.Context, n *node, blockRoot phase0.Root) ([]*Attestation, error) {
+	resp, err := s.doNodeRequest(ctx, n, "GET", fmt.Sprintf("/eth/v2/beacon/blocks/0x%x/attestations", blockRoot), nil, nil)
+	if err != nil {
+		s.markNodeUnhealthy(n)
 
-	var (
-		lastErr  error
-		notFound bool
-	)
+		return nil, err
+	}
 
-	for _, n := range s.getHealthyNodes() {
-		resp, err := s.doNodeRequest(ctx, n, "GET", path, nil, nil)
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, errNotFound
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: attestations request returned status %d", ErrRequestFailed, resp.StatusCode)
+	}
+
+	var result struct {
+		Version string            `json:"version"`
+		Data    []json.RawMessage `json:"data"`
+	}
+
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode attestations response: %w", err)
+	}
+
+	attestations := make([]*Attestation, 0, len(result.Data))
+
+	for _, raw := range result.Data {
+		att, err := s.parseAttestation(raw, result.Version)
 		if err != nil {
-			lastErr = err
-			s.markNodeUnhealthy(n)
+			s.log.WithError(err).Debug("failed to parse attestation")
 
 			continue
 		}
 
-		// A single node's 404 is not authoritative — orphaned blocks in
-		// particular are only stored by nodes that saw them; keep asking.
-		if resp.StatusCode == http.StatusNotFound {
-			_ = resp.Body.Close()
+		attestations = append(attestations, att)
+	}
 
-			notFound = true
+	return attestations, nil
+}
 
-			continue
-		}
+type headerResult struct {
+	root   phase0.Root
+	signed *SignedBeaconBlockHeader
+}
 
-		defer func() { _ = resp.Body.Close() }()
+func (s *service) fetchHeader(ctx context.Context, n *node, blockID string) (*headerResult, error) {
+	resp, err := s.doNodeRequest(ctx, n, "GET", "/eth/v1/beacon/headers/"+blockID, nil, nil)
+	if err != nil {
+		s.markNodeUnhealthy(n)
 
-		var result struct {
-			Data struct {
-				Header struct {
-					Message struct {
-						Slot          string `json:"slot"`
-						ProposerIndex string `json:"proposer_index"`
-						ParentRoot    string `json:"parent_root"`
-						StateRoot     string `json:"state_root"`
-						BodyRoot      string `json:"body_root"`
-					} `json:"message"`
-					Signature string `json:"signature"`
-				} `json:"header"`
-			} `json:"data"`
-		}
+		return nil, err
+	}
 
-		if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
-			lastErr = fmt.Errorf("failed to decode header response: %w", err)
+	defer func() { _ = resp.Body.Close() }()
 
-			continue
-		}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, errNotFound
+	}
 
-		slot, _ := parseUint64(result.Data.Header.Message.Slot)
-		proposerIndex, _ := parseUint64(result.Data.Header.Message.ProposerIndex)
-		parentRoot, _ := parseRoot(result.Data.Header.Message.ParentRoot)
-		stateRoot, _ := parseRoot(result.Data.Header.Message.StateRoot)
-		bodyRoot, _ := parseRoot(result.Data.Header.Message.BodyRoot)
-		sig, _ := parseSignature(result.Data.Header.Signature)
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("%w: header request returned status %d", ErrRequestFailed, resp.StatusCode)
+	}
 
-		s.markNodeHealthy(n)
+	var result struct {
+		Data struct {
+			Root   string `json:"root"`
+			Header struct {
+				Message struct {
+					Slot          string `json:"slot"`
+					ProposerIndex string `json:"proposer_index"`
+					ParentRoot    string `json:"parent_root"`
+					StateRoot     string `json:"state_root"`
+					BodyRoot      string `json:"body_root"`
+				} `json:"message"`
+				Signature string `json:"signature"`
+			} `json:"header"`
+		} `json:"data"`
+	}
 
-		return &SignedBeaconBlockHeader{
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, fmt.Errorf("failed to decode header response: %w", err)
+	}
+
+	root, err := parseRoot(result.Data.Root)
+	if err != nil {
+		return nil, fmt.Errorf("invalid header root: %w", err)
+	}
+
+	stateRoot, err := parseRoot(result.Data.Header.Message.StateRoot)
+	if err != nil {
+		return nil, fmt.Errorf("invalid header state root: %w", err)
+	}
+
+	slot, _ := parseUint64(result.Data.Header.Message.Slot)
+	proposerIndex, _ := parseUint64(result.Data.Header.Message.ProposerIndex)
+	parentRoot, _ := parseRoot(result.Data.Header.Message.ParentRoot)
+	bodyRoot, _ := parseRoot(result.Data.Header.Message.BodyRoot)
+	sig, _ := parseHexBytes(result.Data.Header.Signature)
+
+	s.markNodeHealthy(n)
+
+	return &headerResult{
+		root: root,
+		signed: &SignedBeaconBlockHeader{
 			Message: &BeaconBlockHeader{
 				Slot:          phase0.Slot(slot),
 				ProposerIndex: phase0.ValidatorIndex(proposerIndex),
@@ -686,7 +760,35 @@ func (s *service) GetSignedBlockHeader(
 				BodyRoot:      bodyRoot,
 			},
 			Signature: sig,
-		}, nil
+		},
+	}, nil
+}
+
+// GetSignedBlockHeader retrieves a signed block header by block root.
+func (s *service) GetSignedBlockHeader(
+	ctx context.Context,
+	blockRoot phase0.Root,
+) (*SignedBeaconBlockHeader, error) {
+	var (
+		lastErr  error
+		notFound bool
+	)
+
+	for _, n := range s.getHealthyNodes() {
+		header, err := s.fetchHeader(ctx, n, fmt.Sprintf("0x%x", blockRoot))
+		if errors.Is(err, errNotFound) {
+			notFound = true
+
+			continue
+		}
+
+		if err != nil {
+			lastErr = err
+
+			continue
+		}
+
+		return header.signed, nil
 	}
 
 	if notFound {
@@ -737,7 +839,7 @@ func (s *service) resolveElectraValidators(
 	offset := 0
 
 	for _, committeeIdx := range committeeIndicesFromBits(att.CommitteeBits) {
-		committee, err := s.committeeAt(ctx, att.Data.Slot, committeeIdx)
+		committee, err := s.committeeAt(ctx, att, committeeIdx)
 		if err != nil {
 			return nil, err
 		}
@@ -768,7 +870,7 @@ func (s *service) resolvePhase0Validators(
 	ctx context.Context,
 	att *Attestation,
 ) ([]phase0.ValidatorIndex, error) {
-	committee, err := s.committeeAt(ctx, att.Data.Slot, att.Data.Index)
+	committee, err := s.committeeAt(ctx, att, att.Data.Index)
 	if err != nil {
 		return nil, err
 	}
@@ -804,21 +906,26 @@ func committeeIndicesFromBits(bits []byte) []phase0.CommitteeIndex {
 
 func (s *service) committeeAt(
 	ctx context.Context,
-	slot phase0.Slot,
+	att *Attestation,
 	index phase0.CommitteeIndex,
 ) ([]phase0.ValidatorIndex, error) {
-	committee := s.getCachedCommittee(slot, index)
-	if committee != nil {
+	if att.StateRoot == (phase0.Root{}) {
+		return nil, fmt.Errorf("%w: slot %d", ErrMissingBlockState, att.Data.Slot)
+	}
+
+	key := committeeKey{stateRoot: att.StateRoot, slot: att.Data.Slot, index: index}
+
+	if committee := s.getCachedCommittee(key); committee != nil {
 		return committee, nil
 	}
 
-	if _, err := s.GetCommittees(ctx, slot); err != nil {
-		return nil, fmt.Errorf("failed to fetch committees: %w", err)
+	if err := s.fetchStateCommittees(ctx, att); err != nil {
+		return nil, fmt.Errorf("failed to fetch committees from state 0x%x: %w", att.StateRoot, err)
 	}
 
-	committee = s.getCachedCommittee(slot, index)
+	committee := s.getCachedCommittee(key)
 	if committee == nil {
-		return nil, fmt.Errorf("committee not found for slot %d index %d", slot, index)
+		return nil, fmt.Errorf("committee not found for slot %d index %d in state 0x%x", att.Data.Slot, index, att.StateRoot)
 	}
 
 	return committee, nil
@@ -826,16 +933,18 @@ func (s *service) committeeAt(
 
 // SubmitAttesterSlashing submits an attester slashing to all beacon nodes.
 func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *AttesterSlashing) error {
-	body, err := s.marshalSlashing(slashing)
-	if err != nil {
-		return fmt.Errorf("failed to marshal slashing: %w", err)
-	}
-
-	// The Electra-shaped AttesterSlashing must go to the v2 pool endpoint with
-	// an Eth-Consensus-Version header; only pre-Electra proofs use v1.
 	version := slashing.Version
 	if version == "" {
 		version = "electra"
+	}
+
+	if IsPQ(version) {
+		return ErrPQAttesterSlashing
+	}
+
+	body, err := s.marshalSlashing(slashing)
+	if err != nil {
+		return fmt.Errorf("failed to marshal slashing: %w", err)
 	}
 
 	path := "/eth/v2/beacon/pool/attester_slashings"
@@ -846,53 +955,59 @@ func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *Attester
 		headers = nil
 	}
 
+	return s.submit(ctx, path, body, headers)
+}
+
+func (s *service) submit(ctx context.Context, path string, body []byte, headers map[string]string) error {
+	key := sha256.Sum256(append([]byte(path), body...))
+
+	s.submissionMu.Lock()
+	outcome := s.submissions[key]
+	s.submissionMu.Unlock()
+
+	switch outcome {
+	case submissionRejected:
+		return ErrPreviouslyRejected
+	case submissionAccepted:
+		return ErrAlreadySubmitted
+	}
+
 	var (
-		successCount int
-		lastErr      error
+		canary  *node
+		lastErr error
 	)
 
-	var rejection string
-
-	for _, n := range s.nodes {
-		resp, err := s.doNodeRequest(ctx, n, "POST", path, body, headers)
+	for _, n := range s.getHealthyNodes() {
+		status, reason, err := s.post(ctx, n, path, body, headers)
 		if err != nil {
 			lastErr = err
 
 			continue
 		}
 
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
-			_ = resp.Body.Close()
-			successCount++
+		if status == http.StatusOK || status == http.StatusAccepted {
+			canary = n
 
-			s.log.WithField("endpoint", n.display).Debug("submitted slashing to node")
-
-			continue
+			break
 		}
 
-		// Capture why the node refused: a rejected proof is rare and always a
-		// bug in either detection or proof construction, so the reason and the
-		// payload needed to replay it must reach the logs.
-		reason, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
-		_ = resp.Body.Close()
+		if status == http.StatusBadRequest {
+			s.remember(key, submissionRejected)
 
-		if rejection == "" {
-			rejection = string(reason)
+			s.log.WithFields(logrus.Fields{
+				"endpoint": n.display,
+				"status":   status,
+				"reason":   reason,
+				"payload":  string(body),
+			}).Warn("slashing rejected by validating node, not broadcasting")
+
+			return fmt.Errorf("%w: %s: %s", ErrSlashingRejected, n.display, reason)
 		}
 
-		s.log.WithFields(logrus.Fields{
-			"endpoint": n.display,
-			"status":   resp.StatusCode,
-			"reason":   string(reason),
-		}).Warn("failed to submit slashing")
+		lastErr = fmt.Errorf("%w: %s returned status %d: %s", ErrRequestFailed, n.display, status, reason)
 	}
 
-	if successCount == 0 {
-		s.log.WithFields(logrus.Fields{
-			"rejection": rejection,
-			"payload":   string(body),
-		}).Warn("slashing rejected by every node")
-
+	if canary == nil {
 		if lastErr != nil {
 			return lastErr
 		}
@@ -900,9 +1015,71 @@ func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *Attester
 		return ErrAllNodesFailed
 	}
 
-	s.log.WithField("nodes", successCount).Info("submitted slashing to beacon nodes")
+	s.remember(key, submissionAccepted)
+
+	successCount := 1
+
+	for _, n := range s.nodes {
+		if n == canary {
+			continue
+		}
+
+		status, reason, err := s.post(ctx, n, path, body, headers)
+		if err != nil {
+			s.log.WithError(err).WithField("endpoint", n.display).Debug("failed to broadcast slashing")
+
+			continue
+		}
+
+		if status == http.StatusOK || status == http.StatusAccepted {
+			successCount++
+
+			continue
+		}
+
+		s.log.WithFields(logrus.Fields{
+			"endpoint": n.display,
+			"status":   status,
+			"reason":   reason,
+		}).Debug("node did not accept broadcast slashing")
+	}
+
+	s.log.WithFields(logrus.Fields{
+		"path":  path,
+		"nodes": successCount,
+	}).Info("submitted slashing to beacon nodes")
 
 	return nil
+}
+
+func (s *service) post(
+	ctx context.Context,
+	n *node,
+	path string,
+	body []byte,
+	headers map[string]string,
+) (int, string, error) {
+	resp, err := s.doNodeRequest(ctx, n, "POST", path, body, headers)
+	if err != nil {
+		return 0, "", err
+	}
+
+	defer func() { _ = resp.Body.Close() }()
+
+	reason, _ := io.ReadAll(io.LimitReader(resp.Body, 512))
+
+	return resp.StatusCode, string(reason), nil
+}
+
+func (s *service) remember(key [32]byte, outcome submissionOutcome) {
+	s.submissionMu.Lock()
+	defer s.submissionMu.Unlock()
+
+	if len(s.submissions) >= maxRememberedSubmissions {
+		clear(s.submissions)
+	}
+
+	s.submissions[key] = outcome
 }
 
 func (s *service) marshalSlashing(slashing *AttesterSlashing) ([]byte, error) {
@@ -921,8 +1098,11 @@ func (s *service) marshalSlashing(slashing *AttesterSlashing) ([]byte, error) {
 				Root  string `json:"root"`
 			} `json:"target"`
 		} `json:"data"`
-		Signature string `json:"signature"`
+		Signature string `json:"signature,omitempty"`
+		Proof     string `json:"proof,omitempty"`
 	}
+
+	pq := IsPQ(slashing.Version)
 
 	toAPI := func(att *IndexedAttestation) apiAttestation {
 		indices := make([]string, 0, len(att.AttestingIndices))
@@ -963,16 +1143,26 @@ func (s *service) marshalSlashing(slashing *AttesterSlashing) ([]byte, error) {
 					Root:  fmt.Sprintf("0x%x", att.Data.Target.Root),
 				},
 			},
-			Signature: fmt.Sprintf("0x%x", att.Signature),
 		}
+	}
+
+	withAuth := func(att *IndexedAttestation) apiAttestation {
+		a := toAPI(att)
+		if pq {
+			a.Proof = fmt.Sprintf("0x%x", att.Proof)
+		} else {
+			a.Signature = fmt.Sprintf("0x%x", att.Signature)
+		}
+
+		return a
 	}
 
 	apiSlashing := struct {
 		Attestation1 apiAttestation `json:"attestation_1"`
 		Attestation2 apiAttestation `json:"attestation_2"`
 	}{
-		Attestation1: toAPI(slashing.Attestation1),
-		Attestation2: toAPI(slashing.Attestation2),
+		Attestation1: withAuth(slashing.Attestation1),
+		Attestation2: withAuth(slashing.Attestation2),
 	}
 
 	return json.Marshal(apiSlashing)
@@ -985,44 +1175,7 @@ func (s *service) SubmitProposerSlashing(ctx context.Context, slashing *Proposer
 		return fmt.Errorf("failed to marshal proposer slashing: %w", err)
 	}
 
-	var (
-		successCount int
-		lastErr      error
-	)
-
-	for _, n := range s.nodes {
-		resp, err := s.doNodeRequest(ctx, n, "POST", "/eth/v1/beacon/pool/proposer_slashings", body, nil)
-		if err != nil {
-			lastErr = err
-
-			continue
-		}
-
-		_ = resp.Body.Close()
-
-		if resp.StatusCode == http.StatusOK || resp.StatusCode == http.StatusAccepted {
-			successCount++
-
-			s.log.WithField("endpoint", n.display).Debug("submitted proposer slashing to node")
-		} else {
-			s.log.WithFields(logrus.Fields{
-				"endpoint": n.display,
-				"status":   resp.StatusCode,
-			}).Warn("failed to submit proposer slashing")
-		}
-	}
-
-	if successCount == 0 {
-		if lastErr != nil {
-			return lastErr
-		}
-
-		return ErrAllNodesFailed
-	}
-
-	s.log.WithField("nodes", successCount).Info("submitted proposer slashing to beacon nodes")
-
-	return nil
+	return s.submit(ctx, "/eth/v1/beacon/pool/proposer_slashings", body, nil)
 }
 
 func (s *service) marshalProposerSlashing(slashing *ProposerSlashing) ([]byte, error) {
@@ -1413,6 +1566,14 @@ func parseRoot(s string) (phase0.Root, error) {
 	copy(root[:], bytes)
 
 	return root, nil
+}
+
+func parseHexBytes(s string) ([]byte, error) {
+	if len(s) < 2 {
+		return nil, errors.New("hex value too short")
+	}
+
+	return hex.DecodeString(strings.TrimPrefix(s, "0x"))
 }
 
 func parseSignature(s string) (phase0.BLSSignature, error) {

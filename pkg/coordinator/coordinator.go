@@ -235,7 +235,7 @@ func (s *service) handleBlock(event *beacon.BlockEvent) {
 func (s *service) handleHead(event *beacon.HeadEvent) {
 	s.log.WithField("slot", event.Slot).Debug("new head received")
 
-	attestations, err := s.beacon.GetBlockAttestations(s.ctx, event.Slot)
+	attestations, err := s.beacon.GetBlockAttestationsByRoot(s.ctx, event.Block)
 	if err != nil {
 		s.log.WithError(err).WithField("slot", event.Slot).Warn("failed to get block attestations")
 

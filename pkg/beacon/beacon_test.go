@@ -12,6 +12,8 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
+var testStateRoot = phase0.Root{0x5e}
+
 func newTestService(t *testing.T, endpoints ...string) *service {
 	t.Helper()
 
@@ -68,8 +70,8 @@ func TestResolveElectraValidators(t *testing.T) {
 	slot := phase0.Slot(100)
 
 	// Committee 1 has validators 10,11,12; committee 3 has 20,21.
-	s.cacheCommittee(&Committee{Index: 1, Slot: slot, Validators: []phase0.ValidatorIndex{10, 11, 12}})
-	s.cacheCommittee(&Committee{Index: 3, Slot: slot, Validators: []phase0.ValidatorIndex{20, 21}})
+	s.cacheCommittee(testStateRoot, &Committee{Index: 1, Slot: slot, Validators: []phase0.ValidatorIndex{10, 11, 12}})
+	s.cacheCommittee(testStateRoot, &Committee{Index: 3, Slot: slot, Validators: []phase0.ValidatorIndex{20, 21}})
 
 	// aggregation_bits concatenates committee 1 (3 bits) then committee 3
 	// (2 bits): set bits 0, 2 (validators 10, 12) and bit 4 (validator 21),
@@ -79,6 +81,7 @@ func TestResolveElectraValidators(t *testing.T) {
 		CommitteeBits:   []byte{0b00001010},
 		Data:            &AttestationData{Slot: slot, Index: 0},
 		Version:         "electra",
+		StateRoot:       testStateRoot,
 	}
 
 	got, err := s.ResolveAttestingValidators(context.Background(), att)
@@ -102,12 +105,13 @@ func TestResolveElectraValidatorsBitsTooShort(t *testing.T) {
 	s := newTestService(t)
 
 	slot := phase0.Slot(100)
-	s.cacheCommittee(&Committee{Index: 0, Slot: slot, Validators: make([]phase0.ValidatorIndex, 20)})
+	s.cacheCommittee(testStateRoot, &Committee{Index: 0, Slot: slot, Validators: make([]phase0.ValidatorIndex, 20)})
 
 	att := &Attestation{
 		AggregationBits: []byte{0xff}, // 8 bits for a 20-validator committee
 		CommitteeBits:   []byte{0x01},
 		Data:            &AttestationData{Slot: slot},
+		StateRoot:       testStateRoot,
 	}
 
 	if _, err := s.ResolveAttestingValidators(context.Background(), att); err == nil {
@@ -119,11 +123,12 @@ func TestResolvePhase0Validators(t *testing.T) {
 	s := newTestService(t)
 
 	slot := phase0.Slot(50)
-	s.cacheCommittee(&Committee{Index: 2, Slot: slot, Validators: []phase0.ValidatorIndex{7, 5, 9}})
+	s.cacheCommittee(testStateRoot, &Committee{Index: 2, Slot: slot, Validators: []phase0.ValidatorIndex{7, 5, 9}})
 
 	att := &Attestation{
 		AggregationBits: []byte{0b00000101},
 		Data:            &AttestationData{Slot: slot, Index: 2},
+		StateRoot:       testStateRoot,
 	}
 
 	got, err := s.ResolveAttestingValidators(context.Background(), att)

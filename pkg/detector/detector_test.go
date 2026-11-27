@@ -131,3 +131,22 @@ func TestSlashingVersionUsesNewerFork(t *testing.T) {
 		t.Fatalf("version = %q, want gloas", (*slashings)[0].Version)
 	}
 }
+
+func TestPQEquivocationIsDetectedButNotSubmitted(t *testing.T) {
+	stub := &stubBeacon{validatorsBySig: map[byte][]phase0.ValidatorIndex{
+		0x01: {1, 2},
+		0x02: {2, 3},
+	}}
+
+	svc, slashings := newTestDetector(t, stub)
+
+	svc.HandleCandidate(context.Background(), makeCandidate("gloas", "pq"))
+
+	if len(*slashings) != 0 {
+		t.Fatalf("got %d slashings, want 0 on pq", len(*slashings))
+	}
+
+	if got := svc.(*service).pqEquivocations; got != 1 {
+		t.Fatalf("pq equivocations = %d, want 1", got)
+	}
+}

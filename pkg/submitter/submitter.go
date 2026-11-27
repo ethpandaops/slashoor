@@ -2,6 +2,7 @@ package submitter
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 
@@ -89,7 +90,7 @@ func (s *service) SubmitAttesterSlashing(slashing *beacon.AttesterSlashing) {
 	s.log.WithFields(logFields).Info("submitting attester slashing")
 
 	if err := s.beacon.SubmitAttesterSlashing(s.ctx, slashing); err != nil {
-		s.log.WithError(err).WithFields(logFields).Error("failed to submit attester slashing")
+		s.logSubmitError(err, logFields, "attester")
 
 		return
 	}
@@ -122,7 +123,7 @@ func (s *service) SubmitProposerSlashing(slashing *beacon.ProposerSlashing) {
 	s.log.WithFields(logFields).Info("submitting proposer slashing")
 
 	if err := s.beacon.SubmitProposerSlashing(s.ctx, slashing); err != nil {
-		s.log.WithError(err).WithFields(logFields).Error("failed to submit proposer slashing")
+		s.logSubmitError(err, logFields, "proposer")
 
 		return
 	}
@@ -130,4 +131,17 @@ func (s *service) SubmitProposerSlashing(slashing *beacon.ProposerSlashing) {
 	s.proposerSlashingsCount++
 
 	s.log.WithFields(logFields).Info("successfully submitted proposer slashing")
+}
+
+func (s *service) logSubmitError(err error, fields logrus.Fields, kind string) {
+	log := s.log.WithError(err).WithFields(fields).WithField("kind", kind)
+
+	switch {
+	case errors.Is(err, beacon.ErrAlreadySubmitted), errors.Is(err, beacon.ErrPreviouslyRejected):
+		log.Debug("skipping slashing that was already handled")
+	case errors.Is(err, beacon.ErrPQAttesterSlashing):
+		log.Warn("not submitting pq attester slashing")
+	default:
+		log.Error("failed to submit slashing")
+	}
 }

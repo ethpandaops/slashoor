@@ -1,6 +1,7 @@
 package indexer
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
@@ -154,7 +155,10 @@ func (s *service) storeAttestation(att *beacon.Attestation) {
 	// processed more than once; storing it again would make every future
 	// conflict report duplicate candidates.
 	for _, stored := range s.attestations[key] {
-		if stored.signature == att.Signature && attestationDataEqual(stored.attestation.Data, att.Data) {
+		if stored.signature == att.Signature &&
+			bytes.Equal(stored.attestation.AggregationBits, att.AggregationBits) &&
+			bytes.Equal(stored.attestation.CommitteeBits, att.CommitteeBits) &&
+			attestationDataEqual(stored.attestation.Data, att.Data) {
 			return
 		}
 	}

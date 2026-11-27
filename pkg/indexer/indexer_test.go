@@ -258,3 +258,23 @@ func TestEpochBounds(t *testing.T) {
 		t.Fatal("CheckSurroundedVote(5,6) should pass with stored (4,7)")
 	}
 }
+
+func TestSameDataDifferentCommitteeIsNotDeduplicated(t *testing.T) {
+	s, _ := newTestIndexer(t, nil)
+
+	a := makeAttestation(64, 0, 1, 2, 0xaa, 0x01, 0x00)
+	a.CommitteeBits = []byte{0x01}
+	b := makeAttestation(64, 0, 1, 2, 0xaa, 0x01, 0x00)
+	b.CommitteeBits = []byte{0x02}
+
+	s.ProcessAttestation(a)
+	s.ProcessAttestation(b)
+
+	s.mu.RLock()
+	stored := len(s.attestations[attestationKey{slot: 64, targetEpoch: 2}])
+	s.mu.RUnlock()
+
+	if stored != 2 {
+		t.Fatalf("stored %d, want 2 for distinct committees with zero signatures", stored)
+	}
+}

@@ -31,6 +31,7 @@ type service struct {
 	mu               sync.RWMutex
 	slashingHandlers []SlashingHandler
 	slashingsCreated uint64
+	pqEquivocations  uint64
 }
 
 // New creates a new detector service.
@@ -56,7 +57,10 @@ func (s *service) Start(ctx context.Context) error {
 
 // Stop shuts down the detector service.
 func (s *service) Stop() error {
-	s.log.WithField("slashings_created", s.slashingsCreated).Info("detector service stopped")
+	s.log.WithFields(logrus.Fields{
+		"slashings_created": s.slashingsCreated,
+		"pq_equivocations":  s.pqEquivocations,
+	}).Info("detector service stopped")
 
 	return nil
 }
@@ -115,6 +119,29 @@ func (s *service) HandleCandidate(ctx context.Context, candidate *indexer.Slashi
 			candidate.Attestation1.Version,
 			candidate.Attestation2.Version,
 		),
+	}
+
+	if beacon.IsPQ(slashing.Version) {
+		s.mu.Lock()
+		s.pqEquivocations++
+		equivocations := s.pqEquivocations
+		s.mu.Unlock()
+
+		s.log.WithFields(logrus.Fields{
+			"type":          candidate.Type.String(),
+			"validators":    overlap,
+			"att1_slot":     candidate.Attestation1.Data.Slot,
+			"att1_source":   candidate.Attestation1.Data.Source.Epoch,
+			"att1_target":   candidate.Attestation1.Data.Target.Epoch,
+			"att1_block":    fmt.Sprintf("0x%x", candidate.Attestation1.BlockRoot),
+			"att2_slot":     candidate.Attestation2.Data.Slot,
+			"att2_source":   candidate.Attestation2.Data.Source.Epoch,
+			"att2_target":   candidate.Attestation2.Data.Target.Epoch,
+			"att2_block":    fmt.Sprintf("0x%x", candidate.Attestation2.BlockRoot),
+			"equivocations": equivocations,
+		}).Warn("pq equivocation detected; not submitting: attester slashings need a per-attestation proof")
+
+		return
 	}
 
 	s.mu.Lock()

@@ -1,0 +1,215 @@
+name: Build DEV version
+
+on:
+  pull_request:
+    types: [labeled, synchronize]
+  workflow_dispatch:
+    inputs:
+      docker_tag:
+        description: "Docker tag"
+        required: true
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  GHCR_REPO: ghcr.io/ethpandaops/slashoor
+
+jobs:
+  prinfo:
+    name: Get PR info
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.info.outputs.build }}
+      docker_tag: ${{ steps.info.outputs.docker_tag }}
+      commit_ref: ${{ steps.info.outputs.commit_ref }}
+    steps:
+      - name: Load PR info
+        id: info
+        env:
+          HAS_LABEL: ${{ github.event_name == 'pull_request' && contains(github.event.pull_request.labels.*.name, 'build-docker-image') }}
+          SAME_REPO: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository }}
+          MANUAL_TAG: ${{ inputs.docker_tag }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          FALLBACK_SHA: ${{ github.sha }}
+        run: |
+          valid='^[A-Za-z0-9_][A-Za-z0-9_.-]{0,100}$'
+          reserved='^(master|main|latest|pr)(-|$)|^v?[0-9]'
+          commit_ref="${HEAD_SHA:-$FALLBACK_SHA}"
+          build=false
+          if [[ -n "$MANUAL_TAG" ]]; then
+            if [[ ! "$MANUAL_TAG" =~ $valid || "$MANUAL_TAG" =~ $reserved ]]; then
+              echo "::error::reserved or invalid docker tag"
+              exit 1
+            fi
+            tag="$MANUAL_TAG"
+            build=true
+          else
+            tag="${GITHUB_HEAD_REF//\//-}"
+            if [[ ! "$tag" =~ $valid || "$tag" =~ $reserved ]]; then
+              tag="pr-$PR_NUMBER"
+            fi
+            if [[ "$HAS_LABEL" == "true" && "$SAME_REPO" == "true" ]]; then
+              build=true
+            elif [[ "$HAS_LABEL" == "true" ]]; then
+              echo "Skipping docker push for forked PR; dispatch this workflow manually instead."
+            fi
+          fi
+          echo "docker tag: $tag, build: $build, commit: $commit_ref"
+          {
+            echo "build=$build"
+            echo "docker_tag=$tag"
+            echo "commit_ref=$commit_ref"
+          } >> "$GITHUB_OUTPUT"
+
+  build-docker-amd64:
+    name: Build amd64 docker image
+    needs: [prinfo]
+    if: needs.prinfo.outputs.build == 'true'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prinfo.outputs.commit_ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+
+      - name: Build binary
+        env:
+          TAG: ${{ needs.prinfo.outputs.docker_tag }}
+          SHA: ${{ needs.prinfo.outputs.commit_ref }}
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build \
+            -ldflags="-w -s -X github.com/slashoor/slashoor/cmd.Version=${TAG} -X github.com/slashoor/slashoor/cmd.GitCommit=${SHA}" \
+            -o bin/slashoor .
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push image
+        id: push
+        env:
+          TAG: ${{ needs.prinfo.outputs.docker_tag }}
+        run: |
+          set -o pipefail
+          docker build . --file Dockerfile-stub --provenance=false --sbom=false \
+            --tag "$GHCR_REPO:$TAG-amd64" --platform=linux/amd64
+          docker push "$GHCR_REPO:$TAG-amd64" | tee "$RUNNER_TEMP/push.log"
+          digest=$(grep -oE 'digest: sha256:[a-f0-9]{64}' "$RUNNER_TEMP/push.log" | cut -d' ' -f2)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+  build-docker-arm64:
+    name: Build arm64 docker image
+    needs: [prinfo]
+    if: needs.prinfo.outputs.build == 'true'
+    runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prinfo.outputs.commit_ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26.x"
+          check-latest: true
+
+      - name: Build binary
+        env:
+          TAG: ${{ needs.prinfo.outputs.docker_tag }}
+          SHA: ${{ needs.prinfo.outputs.commit_ref }}
+        run: |
+          mkdir -p bin
+          CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build \
+            -ldflags="-w -s -X github.com/slashoor/slashoor/cmd.Version=${TAG} -X github.com/slashoor/slashoor/cmd.GitCommit=${SHA}" \
+            -o bin/slashoor .
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and push image
+        id: push
+        env:
+          TAG: ${{ needs.prinfo.outputs.docker_tag }}
+        run: |
+          set -o pipefail
+          docker build . --file Dockerfile-stub --provenance=false --sbom=false \
+            --tag "$GHCR_REPO:$TAG-arm64" --platform=linux/arm64
+          docker push "$GHCR_REPO:$TAG-arm64" | tee "$RUNNER_TEMP/push.log"
+          digest=$(grep -oE 'digest: sha256:[a-f0-9]{64}' "$RUNNER_TEMP/push.log" | cut -d' ' -f2)
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+
+  build-multiarch-manifest:
+    name: Build multiarch docker manifest
+    needs: [prinfo, build-docker-amd64, build-docker-arm64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Create and push multiarch manifests
+        id: manifest
+        env:
+          TAG: ${{ needs.prinfo.outputs.docker_tag }}
+          SHA: ${{ needs.prinfo.outputs.commit_ref }}
+          AMD64_DIGEST: ${{ needs.build-docker-amd64.outputs.digest }}
+          ARM64_DIGEST: ${{ needs.build-docker-arm64.outputs.digest }}
+        run: |
+          set -o pipefail
+          pairs="${TAG}-amd64@${AMD64_DIGEST} ${TAG}-arm64@${ARM64_DIGEST}"
+          for t in "$TAG" "$TAG-${SHA:0:7}"; do
+            docker manifest create "$GHCR_REPO:$t" \
+              --amend "$GHCR_REPO@${AMD64_DIGEST}" \
+              --amend "$GHCR_REPO@${ARM64_DIGEST}"
+            digest=$(docker manifest push "$GHCR_REPO:$t" | tail -n1)
+            pairs="${pairs} ${t}@${digest}"
+          done
+          echo "pairs=${pairs}" >> "$GITHUB_OUTPUT"
+
+      - name: Mirror to Docker Hub
+        uses: ethpandaops/actions/mirror-image@738aeadbcdc54f1c9af659d35f8ef29dd5c0fae6
+        with:
+          image: slashoor
+          tags: ${{ steps.manifest.outputs.pairs }}
+          mirror-url: ${{ secrets.IMAGE_MIRROR_URL }}

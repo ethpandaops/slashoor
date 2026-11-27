@@ -274,7 +274,7 @@ func TestPQIndexedAttestationShape(t *testing.T) {
 	att := testIndexedAttestation()
 	att.Proof = []byte{0xde, 0xad}
 
-	body, err := s.marshalSlashing(&AttesterSlashing{Attestation1: att, Attestation2: att, Version: "pq"})
+	body, err := s.marshalSlashing(&AttesterSlashing{Attestation1: att, Attestation2: att, Version: "pq"}, "pq")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -293,7 +293,7 @@ func TestPQIndexedAttestationShape(t *testing.T) {
 		t.Fatalf("proof = %s, want 0xdead", att1["proof"])
 	}
 
-	body, err = s.marshalSlashing(&AttesterSlashing{Attestation1: att, Attestation2: att, Version: "gloas"})
+	body, err = s.marshalSlashing(&AttesterSlashing{Attestation1: att, Attestation2: att, Version: "gloas"}, "gloas")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
@@ -331,5 +331,61 @@ func TestPQProposerSlashingKeepsXMSSSignature(t *testing.T) {
 
 	if !strings.Contains(string(body), strings.Repeat("ab", 2404)) {
 		t.Fatal("proposer slashing lost the xmss signature")
+	}
+}
+
+func TestUnknownForkNamesAreNotPQ(t *testing.T) {
+	for _, version := range []string{"", "electra", "gloas", "future-fork"} {
+		if IsPQ(version) {
+			t.Fatalf("IsPQ(%q) = true", version)
+		}
+	}
+
+	if !IsPQ("pq") {
+		t.Fatal(`IsPQ("pq") = false`)
+	}
+}
+
+func TestEmptyVersionSlashingIsElectraShaped(t *testing.T) {
+	node := &fakeNode{postStatus: http.StatusOK}
+	srv := httptest.NewServer(node.handler(t))
+	defer srv.Close()
+
+	s := newTestService(t, srv.URL)
+
+	att := testIndexedAttestation()
+	if err := s.SubmitAttesterSlashing(context.Background(), &AttesterSlashing{Attestation1: att, Attestation2: att}); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	body, err := s.marshalSlashing(&AttesterSlashing{Attestation1: att, Attestation2: att}, "electra")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if !strings.Contains(string(body), `"signature"`) || strings.Contains(string(body), `"proof"`) {
+		t.Fatalf("empty-version slashing is not electra-shaped: %s", body)
+	}
+}
+
+func TestSlashingBodyIgnoresPairOrder(t *testing.T) {
+	s := newTestService(t)
+
+	first := testIndexedAttestation()
+	second := testIndexedAttestation()
+	second.Data.Target.Epoch++
+
+	forward, err := s.marshalSlashing(&AttesterSlashing{Attestation1: first, Attestation2: second}, "electra")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	reversed, err := s.marshalSlashing(&AttesterSlashing{Attestation1: second, Attestation2: first}, "electra")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if string(forward) != string(reversed) {
+		t.Fatalf("pair order changes the body:\n%s\n%s", forward, reversed)
 	}
 }

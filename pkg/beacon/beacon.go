@@ -1,6 +1,7 @@
 package beacon
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -97,9 +98,11 @@ func forkRank(version string) int {
 	return len(forkOrder)
 }
 
-// IsPQ reports whether a fork name is pq or later.
+// IsPQ reports whether a fork name is pq or a later fork in forkOrder.
 func IsPQ(version string) bool {
-	return forkRank(version) >= forkRank("pq")
+	rank := slices.Index(forkOrder, version)
+
+	return rank >= 0 && rank >= slices.Index(forkOrder, "pq")
 }
 
 // NewerForkVersion returns whichever of the two fork names is more recent.
@@ -942,7 +945,7 @@ func (s *service) SubmitAttesterSlashing(ctx context.Context, slashing *Attester
 		return ErrPQAttesterSlashing
 	}
 
-	body, err := s.marshalSlashing(slashing)
+	body, err := s.marshalSlashing(slashing, version)
 	if err != nil {
 		return fmt.Errorf("failed to marshal slashing: %w", err)
 	}
@@ -1082,7 +1085,7 @@ func (s *service) remember(key [32]byte, outcome submissionOutcome) {
 	s.submissions[key] = outcome
 }
 
-func (s *service) marshalSlashing(slashing *AttesterSlashing) ([]byte, error) {
+func (s *service) marshalSlashing(slashing *AttesterSlashing, version string) ([]byte, error) {
 	type apiAttestation struct {
 		AttestingIndices []string `json:"attesting_indices"`
 		Data             struct {
@@ -1102,7 +1105,7 @@ func (s *service) marshalSlashing(slashing *AttesterSlashing) ([]byte, error) {
 		Proof     string `json:"proof,omitempty"`
 	}
 
-	pq := IsPQ(slashing.Version)
+	pq := IsPQ(version)
 
 	toAPI := func(att *IndexedAttestation) apiAttestation {
 		indices := make([]string, 0, len(att.AttestingIndices))
@@ -1157,15 +1160,24 @@ func (s *service) marshalSlashing(slashing *AttesterSlashing) ([]byte, error) {
 		return a
 	}
 
-	apiSlashing := struct {
-		Attestation1 apiAttestation `json:"attestation_1"`
-		Attestation2 apiAttestation `json:"attestation_2"`
-	}{
-		Attestation1: withAuth(slashing.Attestation1),
-		Attestation2: withAuth(slashing.Attestation2),
+	first, err := json.Marshal(withAuth(slashing.Attestation1))
+	if err != nil {
+		return nil, err
 	}
 
-	return json.Marshal(apiSlashing)
+	second, err := json.Marshal(withAuth(slashing.Attestation2))
+	if err != nil {
+		return nil, err
+	}
+
+	if bytes.Compare(first, second) > 0 {
+		first, second = second, first
+	}
+
+	return json.Marshal(struct {
+		Attestation1 json.RawMessage `json:"attestation_1"`
+		Attestation2 json.RawMessage `json:"attestation_2"`
+	}{first, second})
 }
 
 // SubmitProposerSlashing submits a proposer slashing to all beacon nodes.
